@@ -52,6 +52,7 @@ class ArbitrageDetector:
         df["spread_zscore"] = (df["spread"] - rolling_mean) / (rolling_std + 1e-8)
         df["spread_vol"] = df["spread_ret"].rolling(self.window).std()
 
+        # Disable entry in high-noise regimes where z-score edges are less reliable.
         vol_threshold = df["spread_vol"].quantile(self.volatility_filter_quantile)
         df["vol_regime_ok"] = df["spread_vol"] <= vol_threshold
 
@@ -63,6 +64,7 @@ class ArbitrageDetector:
 
         df.loc[long_condition, "signal"] = "ARBITRAGE_LONG_ETF_SHORT_BENCH"
         df.loc[short_condition, "signal"] = "ARBITRAGE_SHORT_ETF_LONG_BENCH"
+        # WATCH is assigned last so extreme entries keep priority over intermediate states.
         df.loc[watch_condition, "signal"] = "WATCH"
 
         return df

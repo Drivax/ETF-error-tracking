@@ -18,6 +18,7 @@ class MarketDataLoader:
     def _standardize_yf_columns(frame: pd.DataFrame) -> pd.DataFrame:
         """Flatten and normalize yfinance columns into lowercase snake_case names."""
         if isinstance(frame.columns, pd.MultiIndex):
+            # yfinance can return MultiIndex columns when batch internals are triggered.
             frame.columns = [col[0] for col in frame.columns]
 
         rename_map = {
@@ -69,6 +70,7 @@ class MarketDataLoader:
         merged["etf_ticker"] = etf_ticker
         merged["benchmark_ticker"] = benchmark_ticker
 
+        # Keep rows only where the two close series are jointly observed.
         merged = merged.replace([pd.NA], pd.NA).dropna(subset=["etf_close", "benchmark_close"])
         return merged
 
@@ -92,6 +94,7 @@ class MarketDataLoader:
                 )
                 frames.append(pair_df)
             except Exception as exc:  # pragma: no cover - defensive branch
+                # Continue on partial failures so one broken symbol does not block the full universe.
                 errors.append(f"{etf_ticker}->{benchmark_ticker}: {exc}")
 
         if not frames:

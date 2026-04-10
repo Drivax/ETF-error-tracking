@@ -152,6 +152,38 @@ Model quality is evaluated with:
 - $R^2$ for explained variance.
 - MAPE (with safe denominator) for relative error context.
 
+### Current Backtest Snapshot (2Y, Daily, All Pairs)
+The following metrics were generated from the current trained artifact and latest 2-year daily dataset:
+
+| Metric | Value |
+|---|---:|
+| MAE | 0.00013064 |
+| RMSE | 0.00049679 |
+| MAPE | 0.05860474 |
+| $R^2$ | 0.987437 |
+| Scored Rows | 1746 |
+
+### Latest Pair Signal Snapshot
+| Pair | Latest Signal | Latest Z-Score | Spread Volatility |
+|---|---|---:|---:|
+| FEZ_^STOXX50E | NORMAL | 0.198123 | 0.009975 |
+| QQQ_^NDX | WATCH | 1.323212 | 0.000363 |
+| SPY_^GSPC | WATCH | 1.530480 | 0.000412 |
+| URTH_ACWI | WATCH | -0.895480 | 0.001444 |
+
+### Visual Results
+#### 1) Model Error Metrics
+![Model Error Metrics](assets/charts/model_metrics.png)
+
+#### 2) SHAP Feature Importance (Top 10)
+![Top SHAP Features](assets/charts/shap_top10.png)
+
+#### 3) Arbitrage Signal Distribution
+![Signal Distribution](assets/charts/signal_distribution.png)
+
+#### 4) Spread Z-Score with Entry Thresholds
+![Spread Z-Score Time Series](assets/charts/zscore_timeseries.png)
+
 Signal engine quality can be monitored with:
 - Precision of arbitrage flags against realized mean-reversion outcomes.
 - Hit ratio under execution delay assumptions.
@@ -165,6 +197,12 @@ Typical expected behavior (instrument and period dependent):
 ## Repository Structure
 ```text
 ETF-error-tracking/
+├─ assets/
+│  └─ charts/
+│     ├─ model_metrics.png
+│     ├─ shap_top10.png
+│     ├─ signal_distribution.png
+│     └─ zscore_timeseries.png
 ├─ app.py
 ├─ config.py
 ├─ main.py

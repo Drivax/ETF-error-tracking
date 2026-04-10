@@ -33,6 +33,7 @@ class FeatureEngineer:
             df[f"tracking_diff_lag_{lag}"] = df["tracking_diff_1"].shift(lag)
 
         for win in [5, 10, 20, 60]:
+            # Mix short and medium windows to capture transient shocks and persistent drift.
             df[f"te_roll_std_{win}"] = df["tracking_diff_1"].rolling(win).std()
             df[f"etf_vol_{win}"] = df["etf_ret_1"].rolling(win).std()
             df[f"benchmark_vol_{win}"] = df["benchmark_ret_1"].rolling(win).std()
@@ -46,12 +47,14 @@ class FeatureEngineer:
         df["price_ratio"] = self._safe_ratio(df["etf_close"], df["benchmark_close"])
         ratio_mean = df["price_ratio"].rolling(self.rolling_window).mean()
         ratio_std = df["price_ratio"].rolling(self.rolling_window).std()
+        # Ratio z-score is a direct dislocation feature used by both model and signal diagnostics.
         df["ratio_zscore"] = self._safe_ratio(df["price_ratio"] - ratio_mean, ratio_std)
 
         df["volume_change_1"] = df["etf_volume"].pct_change().replace([np.inf, -np.inf], np.nan)
         df["hl_spread"] = self._safe_ratio(df["etf_high"] - df["etf_low"], df["etf_close"])
 
         df["realized_te"] = df["tracking_diff_1"].rolling(self.rolling_window).std()
+        # Target is shifted forward to keep a strict predictive setup (no look-ahead leakage).
         df["target_te"] = df["realized_te"].shift(-self.horizon)
 
         return df

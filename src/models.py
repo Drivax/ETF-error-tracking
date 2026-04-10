@@ -103,6 +103,7 @@ class TrackingErrorModel:
         model_df = model_df.dropna(subset=feature_columns)
 
         train_df, test_df = time_split(model_df, test_size=test_size)
+        # Minimum sample checks protect against unstable metrics on tiny segments.
         if len(train_df) < 100 or len(test_df) < 20:
             raise ValueError("Insufficient rows after preprocessing for reliable training/evaluation.")
 
@@ -142,6 +143,7 @@ class TrackingErrorModel:
         model = self.pipeline.named_steps["model"]
 
         transformed = preprocessor.transform(sample)
+        # TreeExplainer expects a dense matrix for this estimator and sklearn pipeline combination.
         transformed_dense = transformed.toarray() if hasattr(transformed, "toarray") else transformed
 
         feature_names = preprocessor.get_feature_names_out()
@@ -202,6 +204,7 @@ class TrackingErrorModel:
             trial = row.copy()
             trial.loc[trial.index[0], variable_columns] = x
             pred = float(self.predict(trial)[0])
+            # Penalize large feature moves to keep counterfactuals close to feasible market states.
             distance = float(np.mean(np.abs((x - base_values) / std_vector)))
             return pred + distance_weight * distance
 
