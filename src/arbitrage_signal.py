@@ -1,230 +1,277 @@
-"""Actionable arbitrage signal generation for ETF creation/redemption workflows.
+"""Arbitrage signal generation for ETF creation and redemption decisions.
 
-Compared to pure z-score flags, this module produces desk-ready decisions with:
-- Backtest-calibrated entry thresholds.
-- Estimated net profitability after costs and slippage.
-- Confidence score from historical hit ratio and prediction uncertainty.
-- Recommended action size that scales with both edge and risk budget.
+This module produces conservative, production-ready signals from predicted tracking
+error. It is designed for desk usage where capital allocation must remain risk-aware.
+
+Signal convention used by this implementation:
+- Positive predicted tracking error (ETF premium) -> CREATE
+- Negative predicted tracking error (ETF discount) -> REDEEM
+- Low confidence or weak edge -> HOLD
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
 
 @dataclass(frozen=True)
-class ArbitrageSignalDecision:
-    """One arbitrage recommendation for a pair at a timestamp."""
+class ArbitrageSignalOutput:
+    """Structured signal output for one ETF pair at a given timestamp."""
 
     timestamp: pd.Timestamp
     pair: str
-    signal: str
     action: str
-    signal_strength: float
-    confidence_level: float
-    estimated_gross_profit_bps: float
-    estimated_net_profit_bps: float
-    expected_holding_bars: int
-    recommended_action_notional: float
-    spread_zscore: float
-    spread_volatility: float
-    calibrated_entry_threshold: float
+    confidence: float
+    recommended_shares: int
+    notional: float
+    estimated_profit: float
+    estimated_profit_bps: float
+    predicted_tracking_error: float
+    liquidity_score: float
+    persistence_score: float
+    reason: str
 
-    def to_dict(self) -> dict[str, float | str | pd.Timestamp]:
-        """Convert decision dataclass to dictionary for DataFrame assembly."""
-        return asdict(self)
+    def to_dict(self) -> dict[str, float | str | int | pd.Timestamp]:
+        """Serialize dataclass output into a dict for DataFrame usage."""
+        return {
+            "timestamp": self.timestamp,
+            "pair": self.pair,
+            "action": self.action,
+            "confidence": self.confidence,
+            "recommended_shares": self.recommended_shares,
+            "notional": self.notional,
+            "estimated_profit": self.estimated_profit,
+            "estimated_profit_bps": self.estimated_profit_bps,
+            "predicted_tracking_error": self.predicted_tracking_error,
+            "liquidity_score": self.liquidity_score,
+            "persistence_score": self.persistence_score,
+            "reason": self.reason,
+        }
 
 
 class ArbitrageSignalGenerator:
-    """Generate calibrated creation/redemption signals from spread dislocations."""
+    """Generate actionable and conservative CREATE/REDEEM/HOLD decisions.
+
+    The confidence score combines:
+    - Magnitude of predicted deviation
+    - Persistence of deviation in recent realized observations
+    - ETF liquidity proxy
+    """
 
     def __init__(
         self,
-        rolling_window: int = 60,
-        holding_bars: int = 6,
-        execution_cost_bps: float = 3.0,
+        confidence_threshold: float = 0.70,
+        entry_tracking_error: float = 0.0005,
+        max_notional: float = 1_500_000.0,
+        transaction_cost_bps: float = 3.0,
         slippage_bps: float = 2.0,
-        base_entry_zscore: float = 2.0,
-        exit_zscore: float = 0.5,
-        risk_budget_notional: float = 1_000_000.0,
+        min_notional: float = 100_000.0,
+        persistence_window: int = 9,
+        liquidity_window: int = 12,
     ) -> None:
-        self.rolling_window = rolling_window
-        self.holding_bars = holding_bars
-        self.execution_cost_bps = execution_cost_bps
+        if not (0.50 <= confidence_threshold <= 0.99):
+            raise ValueError("confidence_threshold must be between 0.50 and 0.99")
+        if entry_tracking_error <= 0:
+            raise ValueError("entry_tracking_error must be strictly positive")
+
+        self.confidence_threshold = confidence_threshold
+        self.entry_tracking_error = entry_tracking_error
+        self.max_notional = max_notional
+        self.min_notional = min_notional
+        self.transaction_cost_bps = transaction_cost_bps
         self.slippage_bps = slippage_bps
-        self.base_entry_zscore = base_entry_zscore
-        self.exit_zscore = exit_zscore
-        self.risk_budget_notional = risk_budget_notional
+        self.persistence_window = persistence_window
+        self.liquidity_window = liquidity_window
 
-        # Threshold can be calibrated from historical data and then reused in production.
-        self.calibrated_entry_zscore = base_entry_zscore
-        self.calibration_summary: dict[str, float] = {}
+    @staticmethod
+    def _clip_01(value: float) -> float:
+        """Clip scalar to the [0, 1] interval."""
+        return float(np.clip(value, 0.0, 1.0))
 
-    def _prepare_spread_frame(self, pair_panel: pd.DataFrame) -> pd.DataFrame:
-        """Build spread and z-score statistics used by both calibration and live decisions."""
-        required_columns = {"etf_close", "benchmark_close"}
-        missing = required_columns.difference(pair_panel.columns)
-        if missing:
-            raise ValueError(f"Missing required price columns for arbitrage logic: {sorted(missing)}")
+    def _deviation_magnitude_score(self, predicted_tracking_error: float) -> float:
+        """Map TE magnitude to a confidence component in [0, 1]."""
+        scaled = abs(predicted_tracking_error) / self.entry_tracking_error
+        # Saturate around 3x threshold to avoid overconfidence on extreme points.
+        return self._clip_01(scaled / 3.0)
 
-        frame = pair_panel.copy().sort_index()
-        frame["spread"] = np.log(frame["etf_close"] / frame["benchmark_close"])
-        frame["spread_change"] = frame["spread"].diff()
-
-        rolling_mean = frame["spread"].rolling(self.rolling_window).mean()
-        rolling_std = frame["spread"].rolling(self.rolling_window).std()
-        frame["spread_zscore"] = (frame["spread"] - rolling_mean) / (rolling_std + 1e-8)
-        frame["spread_volatility"] = frame["spread_change"].rolling(self.rolling_window).std()
-
-        return frame
-
-    def calibrate_threshold(self, history_panel: pd.DataFrame, minimum_samples: int = 150) -> dict[str, float]:
-        """Calibrate entry threshold via simple historical net-capture backtest.
-
-        We test a grid of z-score entry values. For each candidate threshold, we
-        approximate gross spread capture by absolute spread reversion over a fixed
-        holding horizon, then subtract explicit execution and slippage costs.
-        """
-        frame = self._prepare_spread_frame(history_panel)
-        frame["future_spread"] = frame["spread"].shift(-self.holding_bars)
-        frame["future_reversion_bps"] = (frame["spread"].abs() - frame["future_spread"].abs()) * 10000.0
-
-        candidate_thresholds = np.arange(1.5, 3.1, 0.25)
-        best_threshold = self.base_entry_zscore
-        best_score = float("-inf")
-
-        total_cost = self.execution_cost_bps + self.slippage_bps
-
-        for threshold in candidate_thresholds:
-            candidate = frame[frame["spread_zscore"].abs() >= threshold].dropna(subset=["future_reversion_bps"])
-            if len(candidate) < minimum_samples:
-                continue
-
-            net_profit = candidate["future_reversion_bps"] - total_cost
-            hit_ratio = float((net_profit > 0).mean())
-            avg_net = float(net_profit.mean())
-
-            # Composite score balances profitability and consistency.
-            score = avg_net * hit_ratio
-            if score > best_score:
-                best_score = score
-                best_threshold = float(threshold)
-
-        self.calibrated_entry_zscore = best_threshold
-        self.calibration_summary = {
-            "calibrated_entry_zscore": float(best_threshold),
-            "calibration_score": float(best_score if np.isfinite(best_score) else 0.0),
-            "holding_bars": float(self.holding_bars),
-            "execution_cost_bps": float(self.execution_cost_bps),
-            "slippage_bps": float(self.slippage_bps),
-        }
-        return self.calibration_summary
-
-    def _estimate_gross_profit_bps(self, latest_zscore: float, latest_volatility: float) -> float:
-        """Estimate gross capture potential in basis points from dislocation magnitude."""
-        excess_dislocation = max(abs(latest_zscore) - self.exit_zscore, 0.0)
-        gross_profit_bps = excess_dislocation * max(latest_volatility, 1e-8) * np.sqrt(self.holding_bars) * 10000.0
-        return float(gross_profit_bps)
-
-    def _compute_confidence(
+    def _persistence_score(
         self,
-        latest_zscore: float,
-        uncertainty_sigma: float,
         predicted_tracking_error: float,
+        historical_tracking_error: pd.Series | None,
     ) -> float:
-        """Build confidence score from edge magnitude and model uncertainty.
+        """Estimate persistence using recent sign consistency and strength.
 
-        Confidence is intentionally conservative: a strong dislocation can still lead
-        to low confidence when prediction uncertainty is elevated.
+        A signal is more reliable when recent realized deviations share the same sign
+        and are of non-trivial magnitude.
         """
-        edge_component = min(max((abs(latest_zscore) - self.calibrated_entry_zscore) / 2.0, 0.0), 1.0)
+        if historical_tracking_error is None or historical_tracking_error.dropna().empty:
+            return 0.35
 
-        # Uncertainty penalty compares predictive sigma to predicted level.
-        scale = max(predicted_tracking_error, 1e-8)
-        relative_uncertainty = uncertainty_sigma / scale
-        uncertainty_component = max(0.0, 1.0 - min(relative_uncertainty, 1.0))
+        recent = historical_tracking_error.dropna().tail(self.persistence_window)
+        if recent.empty:
+            return 0.35
 
-        confidence = 0.65 * edge_component + 0.35 * uncertainty_component
-        return float(np.clip(confidence, 0.0, 1.0))
+        current_sign = np.sign(predicted_tracking_error)
+        if current_sign == 0:
+            return 0.0
+
+        sign_agreement = float((np.sign(recent) == current_sign).mean())
+        recent_strength = float(np.mean(np.abs(recent)))
+        strength_score = self._clip_01(recent_strength / (2.0 * self.entry_tracking_error))
+        return self._clip_01(0.7 * sign_agreement + 0.3 * strength_score)
+
+    def _liquidity_score(self, pair_panel: pd.DataFrame) -> float:
+        """Compute ETF liquidity score from recent dollar volume.
+
+        We use rolling dollar volume as a practical execution proxy. The scale is
+        intentionally conservative and saturates for very liquid ETFs.
+        """
+        required_columns = {"etf_close", "etf_volume"}
+        if not required_columns.issubset(pair_panel.columns):
+            return 0.4
+
+        frame = pair_panel.dropna(subset=["etf_close", "etf_volume"]).copy()
+        if frame.empty:
+            return 0.4
+
+        frame["dollar_volume"] = frame["etf_close"] * frame["etf_volume"]
+        rolling_dv = frame["dollar_volume"].tail(self.liquidity_window).mean()
+
+        # Normalize against 25 million USD as desk-friendly liquidity reference.
+        liquidity = float(rolling_dv / 25_000_000.0)
+        return self._clip_01(liquidity)
+
+    def _confidence(
+        self,
+        predicted_tracking_error: float,
+        historical_tracking_error: pd.Series | None,
+        pair_panel: pd.DataFrame,
+    ) -> tuple[float, float, float]:
+        """Combine magnitude, persistence, and liquidity into final confidence."""
+        magnitude = self._deviation_magnitude_score(predicted_tracking_error)
+        persistence = self._persistence_score(predicted_tracking_error, historical_tracking_error)
+        liquidity = self._liquidity_score(pair_panel)
+
+        confidence = 0.50 * magnitude + 0.30 * persistence + 0.20 * liquidity
+        return self._clip_01(confidence), persistence, liquidity
+
+    @staticmethod
+    def _estimate_profit(
+        tracking_error: float,
+        notional: float,
+        transaction_cost_bps: float,
+        slippage_bps: float,
+    ) -> tuple[float, float]:
+        """Estimate net expected profit from deviation capture after costs."""
+        gross_profit = abs(tracking_error) * notional
+        costs = ((transaction_cost_bps + slippage_bps) / 10000.0) * notional
+        net_profit = gross_profit - costs
+        net_profit_bps = (net_profit / max(notional, 1e-8)) * 10000.0
+        return float(net_profit), float(net_profit_bps)
 
     def _recommended_notional(
         self,
-        confidence_level: float,
-        signal_strength: float,
+        confidence: float,
         predicted_tracking_error: float,
     ) -> float:
-        """Map signal quality and risk to a recommended action notional."""
-        # Scale down size when predicted TE is high, because execution risk is higher.
-        risk_penalty = 1.0 / (1.0 + predicted_tracking_error * 10000.0)
-        notional = self.risk_budget_notional * confidence_level * signal_strength * risk_penalty
-        return float(max(notional, 0.0))
+        """Size notional conservatively according to confidence and edge quality."""
+        if confidence < self.confidence_threshold:
+            return 0.0
+
+        edge_intensity = self._clip_01(abs(predicted_tracking_error) / (2.5 * self.entry_tracking_error))
+        size_fraction = confidence * edge_intensity
+        proposed_notional = self.max_notional * size_fraction
+
+        if proposed_notional < self.min_notional:
+            return 0.0
+        return float(min(proposed_notional, self.max_notional))
 
     def generate_signal(
         self,
         pair_panel: pd.DataFrame,
         pair_name: str,
         predicted_tracking_error: float,
-        uncertainty_sigma: float,
-    ) -> ArbitrageSignalDecision:
-        """Generate one actionable creation/redemption signal for the latest bar."""
-        frame = self._prepare_spread_frame(pair_panel)
-        latest = frame.dropna(subset=["spread_zscore", "spread_volatility"]).tail(1)
-        if latest.empty:
-            raise ValueError("Insufficient data to compute arbitrage signal.")
+        historical_tracking_error: pd.Series | None = None,
+        etf_price: float | None = None,
+    ) -> ArbitrageSignalOutput:
+        """Generate one conservative arbitrage signal for the latest timestamp.
 
-        row = latest.iloc[0]
-        timestamp = latest.index[-1]
-        zscore = float(row["spread_zscore"])
-        spread_volatility = float(row["spread_volatility"])
+        Parameters
+        ----------
+        pair_panel:
+            Price/volume frame for one ETF-benchmark pair.
+        pair_name:
+            Human-readable pair identifier.
+        predicted_tracking_error:
+            Model-predicted tracking error (decimal form, e.g. 0.001 = 10 bps).
+        historical_tracking_error:
+            Optional recent realized tracking error series used for persistence scoring.
+        etf_price:
+            Optional ETF price override. If None, latest panel close is used.
+        """
+        if pair_panel.empty:
+            raise ValueError("pair_panel must not be empty")
 
-        gross_profit_bps = self._estimate_gross_profit_bps(zscore, spread_volatility)
-        net_profit_bps = gross_profit_bps - self.execution_cost_bps - self.slippage_bps
+        timestamp = pair_panel.index[-1]
+        if etf_price is None:
+            if "etf_close" not in pair_panel.columns:
+                raise ValueError("pair_panel must contain etf_close when etf_price is not provided")
+            etf_price = float(pair_panel["etf_close"].iloc[-1])
 
-        edge_over_threshold = max(abs(zscore) - self.calibrated_entry_zscore, 0.0)
-        signal_strength = float(np.clip(edge_over_threshold / 1.5, 0.0, 1.0))
-        confidence_level = self._compute_confidence(zscore, uncertainty_sigma, predicted_tracking_error)
+        confidence, persistence_score, liquidity_score = self._confidence(
+            predicted_tracking_error=predicted_tracking_error,
+            historical_tracking_error=historical_tracking_error,
+            pair_panel=pair_panel,
+        )
 
-        if abs(zscore) < self.calibrated_entry_zscore or net_profit_bps <= 0:
-            signal = "NO_ACTION"
-            action = "Hold"
-            signal_strength = 0.0
+        recommended_notional = self._recommended_notional(
+            confidence=confidence,
+            predicted_tracking_error=predicted_tracking_error,
+        )
+
+        estimated_profit, estimated_profit_bps = self._estimate_profit(
+            tracking_error=predicted_tracking_error,
+            notional=recommended_notional,
+            transaction_cost_bps=self.transaction_cost_bps,
+            slippage_bps=self.slippage_bps,
+        )
+
+        if confidence < self.confidence_threshold or recommended_notional <= 0 or estimated_profit <= 0:
+            action = "HOLD"
+            reason = (
+                "Signal below confidence or profit threshold; no capital allocation "
+                "recommended under conservative risk rules."
+            )
             recommended_notional = 0.0
-        elif zscore < 0:
-            # ETF cheap to benchmark proxy: buy ETF and short basket (creation style flow).
-            signal = "CREATION_OPPORTUNITY"
-            action = "Buy ETF / Sell Benchmark Basket"
-            recommended_notional = self._recommended_notional(
-                confidence_level=confidence_level,
-                signal_strength=signal_strength,
-                predicted_tracking_error=predicted_tracking_error,
-            )
+            recommended_shares = 0
+            estimated_profit = 0.0
+            estimated_profit_bps = 0.0
         else:
-            # ETF rich to benchmark proxy: sell ETF and buy basket (redemption style flow).
-            signal = "REDEMPTION_OPPORTUNITY"
-            action = "Sell ETF / Buy Benchmark Basket"
-            recommended_notional = self._recommended_notional(
-                confidence_level=confidence_level,
-                signal_strength=signal_strength,
-                predicted_tracking_error=predicted_tracking_error,
+            action = "CREATE" if predicted_tracking_error > 0 else "REDEEM"
+            recommended_shares = int(max(np.floor(recommended_notional / max(etf_price, 1e-6)), 0))
+
+            deviation_direction = "premium" if predicted_tracking_error > 0 else "discount"
+            reason = (
+                f"Significant {deviation_direction} with persistence score {persistence_score:.2f}, "
+                f"liquidity score {liquidity_score:.2f}, and confidence {confidence:.2f}."
             )
 
-        return ArbitrageSignalDecision(
+        return ArbitrageSignalOutput(
             timestamp=timestamp,
             pair=pair_name,
-            signal=signal,
             action=action,
-            signal_strength=float(signal_strength),
-            confidence_level=float(confidence_level),
-            estimated_gross_profit_bps=float(gross_profit_bps),
-            estimated_net_profit_bps=float(net_profit_bps),
-            expected_holding_bars=int(self.holding_bars),
-            recommended_action_notional=float(recommended_notional),
-            spread_zscore=float(zscore),
-            spread_volatility=float(spread_volatility),
-            calibrated_entry_threshold=float(self.calibrated_entry_zscore),
+            confidence=float(confidence),
+            recommended_shares=int(recommended_shares),
+            notional=float(recommended_notional),
+            estimated_profit=float(estimated_profit),
+            estimated_profit_bps=float(estimated_profit_bps),
+            predicted_tracking_error=float(predicted_tracking_error),
+            liquidity_score=float(liquidity_score),
+            persistence_score=float(persistence_score),
+            reason=reason,
         )
 
     def generate_universe_signals(
@@ -232,30 +279,37 @@ class ArbitrageSignalGenerator:
         intraday_panel: pd.DataFrame,
         prediction_snapshot: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Generate latest arbitrage decisions for all pairs in the universe."""
+        """Generate current arbitrage signals across all pairs.
+
+        This method is dashboard-friendly and computes each pair signal from the
+        latest prediction plus recent realized tracking error persistence.
+        """
         if prediction_snapshot.empty:
             return pd.DataFrame()
 
-        rows: list[dict[str, float | str | pd.Timestamp]] = []
+        rows: list[dict[str, float | str | int | pd.Timestamp]] = []
         for pair_name, pair_panel in intraday_panel.groupby("pair", observed=True):
             pair_prediction = prediction_snapshot[prediction_snapshot["pair"] == pair_name]
             if pair_prediction.empty:
                 continue
 
             latest_prediction = pair_prediction.iloc[0]
-            decision = self.generate_signal(
+            pair_panel_sorted = pair_panel.sort_index().copy()
+            pair_panel_sorted["etf_ret"] = pair_panel_sorted["etf_close"].pct_change()
+            pair_panel_sorted["benchmark_ret"] = pair_panel_sorted["benchmark_close"].pct_change()
+            historical_te = (pair_panel_sorted["etf_ret"] - pair_panel_sorted["benchmark_ret"]).dropna()
+
+            signal = self.generate_signal(
                 pair_panel=pair_panel,
                 pair_name=pair_name,
                 predicted_tracking_error=float(latest_prediction["predicted_tracking_error"]),
-                uncertainty_sigma=float(latest_prediction["uncertainty_sigma"]),
+                historical_tracking_error=historical_te,
+                etf_price=float(pair_panel_sorted["etf_close"].iloc[-1]),
             )
-            rows.append(decision.to_dict())
+            rows.append(signal.to_dict())
 
         if not rows:
             return pd.DataFrame()
 
-        signal_df = pd.DataFrame(rows).sort_values(
-            ["estimated_net_profit_bps", "confidence_level"],
-            ascending=[False, False],
-        )
+        signal_df = pd.DataFrame(rows).sort_values(["confidence", "estimated_profit"], ascending=[False, False])
         return signal_df.reset_index(drop=True)

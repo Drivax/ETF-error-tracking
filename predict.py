@@ -126,19 +126,15 @@ def run_realtime_mode(args: argparse.Namespace) -> None:
     print(prediction_snapshot.to_string(index=False))
 
     signal_generator = ArbitrageSignalGenerator(
-        rolling_window=ARBITRAGE_WINDOW,
-        holding_bars=max(3, args.holding_bars),
-        execution_cost_bps=args.execution_cost_bps,
+        confidence_threshold=0.70,
+        entry_tracking_error=0.0005,
+        max_notional=args.risk_budget_notional,
+        min_notional=100_000.0,
+        transaction_cost_bps=args.execution_cost_bps,
         slippage_bps=args.slippage_bps,
-        base_entry_zscore=args.entry_zscore,
-        exit_zscore=args.exit_zscore,
-        risk_budget_notional=args.risk_budget_notional,
+        persistence_window=max(6, ARBITRAGE_WINDOW // 10),
+        liquidity_window=12,
     )
-    calibration = signal_generator.calibrate_threshold(market_panel, minimum_samples=60)
-
-    print("\nCalibrated Threshold")
-    for key, value in calibration.items():
-        print(f"{key}: {value}")
 
     signals = signal_generator.generate_universe_signals(
         intraday_panel=market_panel,

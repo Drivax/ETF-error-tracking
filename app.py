@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -25,6 +26,7 @@ from src.explainability import TrackingErrorExplainer
 from src.features import FeatureEngineer
 from src.models import TrackingErrorModel
 from src.real_time_predictor import RealTimeTrackingErrorPredictor
+from src.utils import time_split
 
 st.set_page_config(page_title="ETF Real-Time Tracking Error Desk", layout="wide")
 
@@ -69,6 +71,51 @@ def load_or_train_model(feature_panel: pd.DataFrame, artifact_path: Path) -> Tra
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     model.save(artifact_path)
     return model
+
+
+def evaluate_backtest_metrics(
+    feature_panel: pd.DataFrame,
+    model: TrackingErrorModel,
+    test_size: float = 0.2,
+) -> dict[str, float]:
+    """Compute current holdout metrics from the latest feature panel.
+
+    This mirrors the project's time-based validation protocol and lets the app show
+    up-to-date model quality after retraining or data refresh.
+    """
+    target_col = "target_te"
+    if target_col not in feature_panel.columns:
+        return {}
+
+    model_df = feature_panel.dropna(subset=[target_col]).copy()
+    feature_columns = [
+        col for col in model_df.columns if col not in {target_col, "etf_ticker", "benchmark_ticker", "signal"}
+    ]
+    model_df = model_df.dropna(subset=feature_columns)
+
+    if len(model_df) < 100:
+        return {}
+
+    _, test_df = time_split(model_df, test_size=test_size)
+    if test_df.empty:
+        return {}
+
+    x_test = test_df[model.numeric_columns + model.categorical_columns]
+    y_test = test_df[target_col].to_numpy()
+    y_pred = model.predict(x_test)
+
+    rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
+    mae = float(np.mean(np.abs(y_test - y_pred)))
+    mape = float(np.mean(np.abs((y_test - y_pred) / (np.abs(y_test) + 1e-8))) )
+    r2 = float(1 - np.sum((y_test - y_pred) ** 2) / (np.sum((y_test - np.mean(y_test)) ** 2) + 1e-12))
+
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "mape": mape,
+        "r2": r2,
+        "scored_rows": float(len(test_df)),
+    }
 
 
 def _build_shap_waterfall_figure(shap_df: pd.DataFrame, top_features: int = 10) -> go.Figure:
@@ -165,6 +212,21 @@ def main() -> None:
     st.subheader("Live Tracking Error Snapshot")
     st.dataframe(latest_predictions, use_container_width=True)
 
+    backtest_metrics = evaluate_backtest_metrics(feature_panel=feature_panel, model=model)
+    if backtest_metrics:
+        st.subheader("Latest Backtest Results")
+        metric_a, metric_b, metric_c, metric_d, metric_e = st.columns(5)
+        with metric_a:
+            st.metric("MAE", f"{backtest_metrics['mae']:.6f}")
+        with metric_b:
+            st.metric("RMSE", f"{backtest_metrics['rmse']:.6f}")
+        with metric_c:
+            st.metric("MAPE", f"{backtest_metrics['mape']:.4f}")
+        with metric_d:
+            st.metric("R2", f"{backtest_metrics['r2']:.4f}")
+        with metric_e:
+            st.metric("Scored Rows", f"{int(backtest_metrics['scored_rows'])}")
+
     selected_pair = st.selectbox("Select Pair", latest_predictions["pair"].tolist())
     selected_series = prediction_series[prediction_series["pair"] == selected_pair].copy()
     selected_series = selected_series.sort_values("timestamp")
@@ -243,17 +305,15 @@ def main() -> None:
 
     st.subheader("Arbitrage Signal Panel")
     signal_generator = ArbitrageSignalGenerator(
-        rolling_window=ARBITRAGE_WINDOW,
-        holding_bars=max(_get_interval_minutes(interval) // 5, 3),
-        execution_cost_bps=3.0,
+        confidence_threshold=0.70,
+        entry_tracking_error=0.0005,
+        max_notional=1_500_000.0,
+        min_notional=100_000.0,
+        transaction_cost_bps=3.0,
         slippage_bps=2.0,
-        base_entry_zscore=2.0,
-        exit_zscore=0.5,
-        risk_budget_notional=1_000_000.0,
+        persistence_window=max(6, ARBITRAGE_WINDOW // 10),
+        liquidity_window=12,
     )
-
-    # Calibrate threshold globally from available history once per run.
-    signal_generator.calibrate_threshold(market_panel, minimum_samples=60)
 
     universe_signals = signal_generator.generate_universe_signals(
         intraday_panel=market_panel,
@@ -263,12 +323,39 @@ def main() -> None:
     if universe_signals.empty:
         st.info("No actionable arbitrage signals at the latest timestamp.")
     else:
-        st.dataframe(universe_signals, use_container_width=True)
+        display_columns = [
+            "pair",
+            "action",
+            "confidence",
+            "recommended_shares",
+            "notional",
+            "estimated_profit",
+            "reason",
+        ]
+        st.dataframe(universe_signals[display_columns], use_container_width=True)
 
         pair_signal = universe_signals[universe_signals["pair"] == selected_pair]
         if not pair_signal.empty:
             st.markdown("**Selected Pair Trade Recommendation**")
-            st.json(pair_signal.iloc[0].to_dict())
+            signal = pair_signal.iloc[0]
+
+            metric_left, metric_mid, metric_right, metric_far = st.columns(4)
+            with metric_left:
+                st.metric("Action", str(signal["action"]))
+            with metric_mid:
+                st.metric("Confidence", f"{float(signal['confidence']):.2f}")
+            with metric_right:
+                st.metric("Recommended Shares", f"{int(signal['recommended_shares']):,}")
+            with metric_far:
+                st.metric("Notional", f"${float(signal['notional']):,.0f}")
+
+            profit_col, score_col = st.columns(2)
+            with profit_col:
+                st.metric("Estimated Net Profit", f"${float(signal['estimated_profit']):,.0f}")
+            with score_col:
+                st.metric("Expected Profit (bps)", f"{float(signal['estimated_profit_bps']):.1f}")
+
+            st.caption(str(signal["reason"]))
 
 
 if __name__ == "__main__":

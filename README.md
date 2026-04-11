@@ -82,19 +82,19 @@ The framework supports:
 - Rolling retrain process for production refresh.
 
 ### Arbitrage Detection Logic
-Arbitrage detection is implemented in `src/arbitrage_detector.py` and combines:
-- Residual dislocation: observed spread minus expected spread.
-- Rolling z-score thresholds.
-- Volatility regime filter.
-- Optional mean-reversion half-life estimate.
+Arbitrage signaling is implemented in `src/arbitrage_signal.py` and combines:
+- Predicted tracking error direction and magnitude.
+- Persistence score from recent realized tracking error.
+- Liquidity score from recent ETF dollar volume.
+- Conservative confidence thresholding (`CREATE`/`REDEEM` only when confidence >= 0.70).
+- Net-profit estimate after explicit transaction costs and slippage.
 
 Signal categories:
-- `NORMAL`
-- `WATCH`
-- `ARBITRAGE_LONG_ETF_SHORT_BENCH`
-- `ARBITRAGE_SHORT_ETF_LONG_BENCH`
+- `CREATE`
+- `REDEEM`
+- `HOLD`
 
-This design is intentionally interpretable. Each signal can be decomposed into quantitative threshold checks.
+This design is intentionally risk-aware. Position size is reduced aggressively when confidence is weak, and no trade is recommended when expected net edge is not attractive.
 
 ## Key Equations
 ### Return Definitions
@@ -157,19 +157,19 @@ The following metrics were generated from the current trained artifact and lates
 
 | Metric | Value |
 |---|---:|
-| MAE | 0.00013064 |
-| RMSE | 0.00049679 |
-| MAPE | 0.05860474 |
-| $R^2$ | 0.987437 |
-| Scored Rows | 1746 |
+| MAE | 0.00026913 |
+| RMSE | 0.00086908 |
+| MAPE | 0.08512167 |
+| $R^2$ | 0.932239 |
+| Scored Rows | 349 |
 
 ### Latest Pair Signal Snapshot
-| Pair | Latest Signal | Latest Z-Score | Spread Volatility |
-|---|---|---:|---:|
-| FEZ_^STOXX50E | NORMAL | 0.198123 | 0.009975 |
-| QQQ_^NDX | WATCH | 1.323212 | 0.000363 |
-| SPY_^GSPC | WATCH | 1.530480 | 0.000412 |
-| URTH_ACWI | WATCH | -0.895480 | 0.001444 |
+| Pair | Action | Confidence | Recommended Shares | Notional (USD) | Estimated Net Profit (USD) |
+|---|---|---:|---:|---:|---:|
+| URTH_ACWI | CREATE | 0.8833 | 7,033 | 1,325,000 | 1,358.58 |
+| FEZ_^STOXX50E | CREATE | 0.8600 | 19,563 | 1,290,000 | 21,344.44 |
+| SPY_^GSPC | HOLD | 0.4876 | 0 | 0 | 0.00 |
+| QQQ_^NDX | HOLD | 0.4728 | 0 | 0 | 0.00 |
 
 ### Visual Results
 #### 1) Model Error Metrics
@@ -192,7 +192,7 @@ Signal engine quality can be monitored with:
 Typical expected behavior (instrument and period dependent):
 - Higher accuracy in stable volatility regimes.
 - Wider forecast errors during stress or opening auction intervals.
-- Better signal precision when z-score is combined with volatility filter.
+- Fewer but higher-conviction arbitrage actions due to confidence and net-edge gating.
 
 ## Repository Structure
 ```text
@@ -217,9 +217,12 @@ ETF-error-tracking/
 └─ src/
 	├─ __init__.py
 	├─ arbitrage_detector.py
+	├─ arbitrage_signal.py
 	├─ data_loader.py
+	├─ explainability.py
 	├─ features.py
 	├─ models.py
+	├─ real_time_predictor.py
 	└─ utils.py
 ```
 
@@ -256,7 +259,12 @@ python predict.py --predict --model-path artifacts/te_model.joblib --lookback-pe
 
 ### 5) Launch Streamlit dashboard
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
+```
+
+### 6) Run real-time CLI workflow
+```bash
+python predict.py --real-time --intraday-period 60d --intraday-interval 5m
 ```
 
 ### 6) Run notebooks
