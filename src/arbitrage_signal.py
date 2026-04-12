@@ -215,6 +215,8 @@ class ArbitrageSignalGenerator:
         if pair_panel.empty:
             raise ValueError("pair_panel must not be empty")
 
+        pair_panel = pair_panel.sort_index()
+
         timestamp = pair_panel.index[-1]
         if etf_price is None:
             if "etf_close" not in pair_panel.columns:
@@ -300,7 +302,7 @@ class ArbitrageSignalGenerator:
             historical_te = (pair_panel_sorted["etf_ret"] - pair_panel_sorted["benchmark_ret"]).dropna()
 
             signal = self.generate_signal(
-                pair_panel=pair_panel,
+                pair_panel=pair_panel_sorted,
                 pair_name=pair_name,
                 predicted_tracking_error=float(latest_prediction["predicted_tracking_error"]),
                 historical_tracking_error=historical_te,

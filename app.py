@@ -21,6 +21,7 @@ from config import (
     PAIR_CONFIGS,
 )
 from src.arbitrage_signal import ArbitrageSignalGenerator
+from src.anomaly_detector import ResidualAnomalyDetector
 from src.data_loader import MarketDataLoader
 from src.explainability import TrackingErrorExplainer
 from src.features import FeatureEngineer
@@ -142,6 +143,44 @@ def _build_shap_waterfall_figure(shap_df: pd.DataFrame, top_features: int = 10) 
         height=420,
     )
     return fig
+
+
+def _build_residual_panel(
+    prediction_series: pd.DataFrame,
+    feature_panel: pd.DataFrame,
+    pair_name: str,
+) -> pd.DataFrame:
+    """Join predictions with realized/target TE to compute residual history.
+
+    The anomaly detector expects residuals defined as:
+    residual = actual_tracking_error - predicted_tracking_error
+    """
+    pair_predictions = prediction_series[prediction_series["pair"] == pair_name].copy()
+    if pair_predictions.empty:
+        return pd.DataFrame()
+
+    pair_actuals = feature_panel[feature_panel["pair"] == pair_name].copy()
+    if pair_actuals.empty:
+        return pd.DataFrame()
+
+    # Prefer predictive target when available; otherwise fallback to realized TE.
+    pair_actuals = pair_actuals.reset_index().rename(columns={"index": "timestamp"})
+    pair_actuals["actual_tracking_error"] = pair_actuals["target_te"].where(
+        pair_actuals["target_te"].notna(),
+        pair_actuals["realized_te"],
+    )
+
+    merged = pair_predictions.merge(
+        pair_actuals[["timestamp", "actual_tracking_error"]],
+        on="timestamp",
+        how="left",
+    )
+    merged = merged.dropna(subset=["predicted_tracking_error", "actual_tracking_error"]).copy()
+    if merged.empty:
+        return merged
+
+    merged["residual"] = merged["actual_tracking_error"] - merged["predicted_tracking_error"]
+    return merged.sort_values("timestamp").reset_index(drop=True)
 
 
 def main() -> None:
@@ -272,6 +311,130 @@ def main() -> None:
             height=420,
         )
         st.plotly_chart(chart, use_container_width=True)
+
+    st.subheader("Anomaly Detection Panel")
+    residual_panel = _build_residual_panel(
+        prediction_series=prediction_series,
+        feature_panel=rt_feature_panel,
+        pair_name=selected_pair,
+    )
+
+    detector_short_window = max(10, int(rolling_window // 2))
+    detector_long_window = max(24, int(rolling_window * 2))
+    required_observations = max(80, detector_long_window * 2)
+
+    if len(residual_panel) < required_observations:
+        st.info(
+            "Not enough residual history for robust structural anomaly detection. "
+            f"Need at least {required_observations} aligned observations for the current "
+            f"window settings (available: {len(residual_panel)})."
+        )
+    else:
+        detector = ResidualAnomalyDetector(
+            short_window=detector_short_window,
+            long_window=detector_long_window,
+            contamination=0.05,
+            normal_quantile=0.85,
+            random_state=42,
+        )
+
+        anomaly_scored = detector.fit_score(
+            actual_tracking_error=residual_panel["actual_tracking_error"],
+            predicted_tracking_error=residual_panel["predicted_tracking_error"],
+        )
+        latest_anomaly = detector.latest_result(
+            actual_tracking_error=residual_panel["actual_tracking_error"],
+            predicted_tracking_error=residual_panel["predicted_tracking_error"],
+        )
+
+        anomaly_plot_data = residual_panel.copy()
+        aligned_scores = anomaly_scored.reset_index().rename(columns={"index": "timestamp"})
+        anomaly_plot_data = anomaly_plot_data.merge(
+            aligned_scores[["timestamp", "anomaly_detected", "confidence", "anomaly_type"]],
+            on="timestamp",
+            how="left",
+        )
+
+        anomaly_chart = go.Figure()
+        anomaly_chart.add_trace(
+            go.Scatter(
+                x=anomaly_plot_data["timestamp"],
+                y=anomaly_plot_data["residual"],
+                mode="lines",
+                name="Residual",
+                line={"color": "#2f4b7c", "width": 2},
+            )
+        )
+
+        flagged = anomaly_plot_data[anomaly_plot_data["anomaly_detected"] == True]
+        if not flagged.empty:
+            anomaly_chart.add_trace(
+                go.Scatter(
+                    x=flagged["timestamp"],
+                    y=flagged["residual"],
+                    mode="markers",
+                    name="Detected Anomaly",
+                    marker={"color": "#d62728", "size": 9, "symbol": "diamond"},
+                    customdata=np.stack(
+                        [
+                            flagged["anomaly_type"].fillna("unknown").astype(str).to_numpy(),
+                            flagged["confidence"].fillna(0.0).astype(float).to_numpy(),
+                        ],
+                        axis=-1,
+                    ),
+                    hovertemplate=(
+                        "Timestamp: %{x}<br>"
+                        "Residual: %{y:.6f}<br>"
+                        "Type: %{customdata[0]}<br>"
+                        "Confidence: %{customdata[1]:.2f}<extra></extra>"
+                    ),
+                )
+            )
+
+        anomaly_chart.update_layout(
+            title=f"{selected_pair}: Residual Structure and Detected Anomalies",
+            xaxis_title="Timestamp",
+            yaxis_title="Residual (Actual - Predicted Tracking Error)",
+            template="plotly_white",
+            height=420,
+        )
+        st.plotly_chart(anomaly_chart, use_container_width=True)
+
+        status_col, type_col, confidence_col, score_col = st.columns(4)
+        with status_col:
+            st.metric("Latest Anomaly", "Yes" if latest_anomaly["anomaly_detected"] else "No")
+        with type_col:
+            st.metric("Anomaly Type", str(latest_anomaly["anomaly_type"]))
+        with confidence_col:
+            st.metric("Confidence", f"{float(latest_anomaly['confidence']):.2f}")
+        with score_col:
+            st.metric("Ensemble Score", f"{float(latest_anomaly['score']):.4f}")
+
+        st.caption(str(latest_anomaly["explanation"]))
+        st.caption(f"Recommended action: {latest_anomaly['recommended_action']}")
+
+        recent_anomalies = anomaly_scored[anomaly_scored["anomaly_detected"] == True].copy()
+        if recent_anomalies.empty:
+            st.info("No structural anomalies were detected for the selected pair in the current window.")
+        else:
+            show_cols = [
+                "residual",
+                "autoencoder_error",
+                "isolation_score",
+                "mean_shift",
+                "volatility_ratio",
+                "autocorr_shift",
+                "anomaly_type",
+                "confidence",
+                "explanation",
+            ]
+            st.markdown("**Recent Detected Anomalies**")
+            st.dataframe(
+                recent_anomalies[show_cols]
+                .tail(12)
+                .sort_index(ascending=False),
+                use_container_width=True,
+            )
 
     st.subheader("SHAP Explainability + Counterfactuals")
     pair_features = rt_feature_panel[rt_feature_panel["pair"] == selected_pair].dropna()

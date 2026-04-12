@@ -60,7 +60,11 @@ class ArbitrageDetector:
 
         long_condition = (df["spread_zscore"] <= -self.zscore_entry) & df["vol_regime_ok"]
         short_condition = (df["spread_zscore"] >= self.zscore_entry) & df["vol_regime_ok"]
-        watch_condition = df["spread_zscore"].abs().between(self.zscore_exit, self.zscore_entry)
+        watch_condition = df["spread_zscore"].abs().between(
+            self.zscore_exit,
+            self.zscore_entry,
+            inclusive="left",
+        )
 
         df.loc[long_condition, "signal"] = "ARBITRAGE_LONG_ETF_SHORT_BENCH"
         df.loc[short_condition, "signal"] = "ARBITRAGE_SHORT_ETF_LONG_BENCH"
