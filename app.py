@@ -32,6 +32,7 @@ from config import (
     DEFAULT_INTRADAY_PERIOD,
     DEFAULT_PERIOD,
     DEFAULT_WINDOW,
+    ETF_SECTOR_MAP,
     MODEL_ARTIFACT_PATH,
     PAIR_CONFIGS,
 )
@@ -41,7 +42,9 @@ from src.data_loader import MarketDataLoader
 from src.explainability import TrackingErrorExplainer
 from src.features import FeatureEngineer
 from src.models import TrackingErrorModel
+from src.portfolio_risk import PortfolioRiskAggregator
 from src.real_time_predictor import RealTimeTrackingErrorPredictor
+from src.regime_detector import AdaptiveThresholdConfig, RegimeDetector
 from src.utils import time_split
 
 
@@ -305,21 +308,29 @@ def _build_residual_panel(
         return pd.DataFrame()
 
     pair_actuals = pair_actuals.reset_index().rename(columns={"index": "timestamp"})
-    pair_actuals["actual_tracking_error"] = pair_actuals["target_te"].where(
-        pair_actuals["target_te"].notna(),
-        pair_actuals["realized_te"],
+    if "timestamp" not in pair_actuals.columns:
+        # Defensive fallback for unexpected index naming.
+        pair_actuals = pair_actuals.rename(columns={pair_actuals.columns[0]: "timestamp"})
+
+    target_te = (
+        pair_actuals["target_te"]
+        if "target_te" in pair_actuals.columns
+        else pd.Series(np.nan, index=pair_actuals.index)
     )
+    realized_te = (
+        pair_actuals["realized_te"]
+        if "realized_te" in pair_actuals.columns
+        else pd.Series(np.nan, index=pair_actuals.index)
+    )
+    pair_actuals["actual_tracking_error"] = target_te.where(target_te.notna(), realized_te)
+
+    merge_columns = ["timestamp", "actual_tracking_error"]
+    for optional_column in ["etf_ticker", "benchmark_ticker", "realized_te"]:
+        if optional_column in pair_actuals.columns:
+            merge_columns.append(optional_column)
 
     merged = pair_predictions.merge(
-        pair_actuals[
-            [
-                "timestamp",
-                "actual_tracking_error",
-                "etf_ticker",
-                "benchmark_ticker",
-                "realized_te",
-            ]
-        ],
+        pair_actuals[merge_columns],
         on="timestamp",
         how="left",
     )
@@ -335,6 +346,7 @@ def compute_latest_anomaly_map(
     prediction_series: pd.DataFrame,
     feature_panel: pd.DataFrame,
     rolling_window: int,
+    regime_latest_map: dict[str, dict[str, object]] | None = None,
 ) -> tuple[dict[str, dict[str, object]], dict[str, pd.DataFrame]]:
     """Compute latest anomaly status and full anomaly history per pair."""
     latest_by_pair: dict[str, dict[str, object]] = {}
@@ -366,10 +378,22 @@ def compute_latest_anomaly_map(
             history_by_pair[pair_name] = pd.DataFrame()
             continue
 
+        adaptive_anomaly_threshold = float(
+            (regime_latest_map or {}).get(pair_name, {}).get("adaptive_thresholds", {}).get(
+                "anomaly_reconstruction_threshold",
+                0.05,
+            )
+        )
+        adaptive_anomaly_threshold = max(adaptive_anomaly_threshold, 1e-6)
+
+        # Lower anomaly threshold implies higher sensitivity.
+        sensitivity_ratio = 0.05 / adaptive_anomaly_threshold
+        adaptive_contamination = float(np.clip(0.05 * sensitivity_ratio, 0.02, 0.20))
+
         detector = ResidualAnomalyDetector(
             short_window=detector_short_window,
             long_window=detector_long_window,
-            contamination=0.05,
+            contamination=adaptive_contamination,
             normal_quantile=0.85,
             random_state=42,
         )
@@ -387,6 +411,132 @@ def compute_latest_anomaly_map(
         history_by_pair[pair_name] = scored
 
     return latest_by_pair, history_by_pair
+
+
+def compute_latest_regime_map(
+    prediction_series: pd.DataFrame,
+    feature_panel: pd.DataFrame,
+    rolling_window: int,
+    base_alert_tracking_error_pct: float,
+    base_arbitrage_confidence_min: float,
+    base_anomaly_threshold: float,
+) -> tuple[dict[str, dict[str, object]], dict[str, pd.DataFrame]]:
+    """Compute latest regime diagnostics and history for each ETF pair."""
+    latest_by_pair: dict[str, dict[str, object]] = {}
+    history_by_pair: dict[str, pd.DataFrame] = {}
+
+    detector = RegimeDetector(
+        rolling_window=max(12, int(rolling_window)),
+        smoothing_alpha=0.35,
+        min_regime_persistence=4,
+        random_state=42,
+        base_thresholds=AdaptiveThresholdConfig(
+            alert_tracking_error=float(base_alert_tracking_error_pct),
+            arbitrage_confidence_min=float(base_arbitrage_confidence_min),
+            anomaly_reconstruction_threshold=float(base_anomaly_threshold),
+        ),
+    )
+
+    for pair_name in prediction_series["pair"].unique().tolist():
+        residual_panel = _build_residual_panel(
+            prediction_series=prediction_series,
+            feature_panel=feature_panel,
+            pair_name=pair_name,
+        )
+
+        if residual_panel.empty:
+            latest_by_pair[pair_name] = {
+                "current_regime": "Calm",
+                "confidence": 1.0,
+                "regime_probability": {"Calm": 1.0, "Stress": 0.0, "High_Vol": 0.0},
+                "adaptive_thresholds": {
+                    "alert_tracking_error": float(base_alert_tracking_error_pct),
+                    "arbitrage_confidence_min": float(base_arbitrage_confidence_min),
+                    "anomaly_reconstruction_threshold": float(base_anomaly_threshold),
+                },
+                "explanation": "No aligned residual panel available for regime estimation.",
+                "model_used": "empty_panel_default",
+                "regime_history": [],
+            }
+            history_by_pair[pair_name] = pd.DataFrame()
+            continue
+
+        regime_result = detector.detect_regime(residual_panel["residual"], history_points=120)
+        latest_by_pair[pair_name] = regime_result
+
+        history_rows = regime_result.get("regime_history", [])
+        if history_rows:
+            history_frame = pd.DataFrame(history_rows)
+            history_frame["timestamp"] = pd.to_datetime(history_frame["timestamp"])
+            history_by_pair[pair_name] = history_frame.sort_values("timestamp").reset_index(drop=True)
+        else:
+            history_by_pair[pair_name] = pd.DataFrame(columns=["timestamp", "regime", "confidence"])
+
+    return latest_by_pair, history_by_pair
+
+
+def regime_badge_html(regime: str) -> str:
+    """Return a compact color-coded regime badge."""
+    color_map = {
+        "Calm": ("#1d8a4c", "#e8f6ee"),
+        "Stress": ("#d97a1f", "#fff4e8"),
+        "High_Vol": ("#cf2e2e", "#fdeaea"),
+    }
+    fg, bg = color_map.get(regime, ("#103a6f", "#e8eef8"))
+    return (
+        "<span style='display:inline-block;padding:6px 10px;border-radius:10px;"
+        f"font-weight:700;color:{fg};background:{bg};border:1px solid {fg}33;'>"
+        f"{regime}"
+        "</span>"
+    )
+
+
+def build_regime_history_chart(regime_history: pd.DataFrame, pair_name: str) -> go.Figure:
+    """Build a compact regime history chart for a selected pair."""
+    regime_to_level = {"Calm": 0, "Stress": 1, "High_Vol": 2}
+    level_to_label = {0: "Calm", 1: "Stress", 2: "High Vol"}
+
+    fig = go.Figure()
+    if not regime_history.empty:
+        plot_df = regime_history.copy()
+        plot_df["regime_level"] = plot_df["regime"].map(regime_to_level).fillna(0)
+
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df["timestamp"],
+                y=plot_df["regime_level"],
+                mode="lines+markers",
+                line={"color": "#103a6f", "width": 2},
+                marker={
+                    "size": 7,
+                    "color": plot_df["confidence"],
+                    "colorscale": "YlOrRd",
+                    "showscale": True,
+                    "colorbar": {"title": "Conf"},
+                },
+                customdata=np.stack([plot_df["regime"], plot_df["confidence"]], axis=1),
+                hovertemplate=(
+                    "Timestamp: %{x}<br>Regime: %{customdata[0]}"
+                    "<br>Confidence: %{customdata[1]:.2f}<extra></extra>"
+                ),
+                name=pair_name,
+            )
+        )
+
+    fig.update_layout(
+        title=f"Regime History - {pair_name}",
+        xaxis_title="Timestamp",
+        yaxis_title="Regime",
+        yaxis={
+            "tickmode": "array",
+            "tickvals": [0, 1, 2],
+            "ticktext": [level_to_label[0], level_to_label[1], level_to_label[2]],
+        },
+        template="plotly_white",
+        height=260,
+        margin={"l": 20, "r": 20, "t": 40, "b": 10},
+    )
+    return fig
 
 
 def build_latest_actual_snapshot(feature_panel: pd.DataFrame) -> pd.DataFrame:
@@ -438,9 +588,33 @@ def build_live_overview_table(
     )
 
     if signal_table.empty:
-        signal_cols = pd.DataFrame(columns=["pair", "action", "confidence", "recommended_shares", "estimated_profit"])
+        signal_cols = pd.DataFrame(
+            columns=[
+                "pair",
+                "action",
+                "confidence",
+                "recommended_shares",
+                "estimated_profit",
+                "regime",
+                "regime_confidence",
+                "applied_alert_tracking_error_pct",
+                "applied_confidence_threshold",
+            ]
+        )
     else:
-        signal_cols = signal_table[["pair", "action", "confidence", "recommended_shares", "estimated_profit"]].copy()
+        signal_cols = signal_table[
+            [
+                "pair",
+                "action",
+                "confidence",
+                "recommended_shares",
+                "estimated_profit",
+                "regime",
+                "regime_confidence",
+                "applied_alert_tracking_error_pct",
+                "applied_confidence_threshold",
+            ]
+        ].copy()
 
     merged = merged.merge(signal_cols, on="pair", how="left")
 
@@ -460,6 +634,10 @@ def build_live_overview_table(
     merged["confidence"] = merged["confidence"].fillna(0.0)
     merged["recommended_shares"] = merged["recommended_shares"].fillna(0).astype(int)
     merged["estimated_profit"] = merged["estimated_profit"].fillna(0.0)
+    merged["regime"] = merged["regime"].fillna("Calm")
+    merged["regime_confidence"] = merged["regime_confidence"].fillna(1.0)
+    merged["applied_alert_tracking_error_pct"] = merged["applied_alert_tracking_error_pct"].fillna(0.80)
+    merged["applied_confidence_threshold"] = merged["applied_confidence_threshold"].fillna(0.70)
 
     merged = merged.sort_values("predicted_error_pct", ascending=False).reset_index(drop=True)
     return merged
@@ -515,6 +693,104 @@ def build_deviation_heatmap(table: pd.DataFrame) -> go.Figure:
         template="plotly_white",
         height=max(300, 70 * len(ranked)),
         margin={"l": 20, "r": 20, "t": 50, "b": 15},
+    )
+    return fig
+
+
+def _default_portfolio_weight_text(etf_tickers: list[str]) -> str:
+    """Build default equal-weight input text for the sidebar."""
+    if not etf_tickers:
+        return ""
+    equal_weight = 1.0 / len(etf_tickers)
+    return ", ".join(f"{ticker}:{equal_weight:.4f}" for ticker in etf_tickers)
+
+
+def parse_portfolio_weights(raw_weights: str, universe_etfs: list[str]) -> tuple[dict[str, float], list[str]]:
+    """Parse weights from 'ETF:weight' comma-separated text and validate entries."""
+    parsed: dict[str, float] = {}
+    errors: list[str] = []
+
+    if not raw_weights.strip():
+        return parsed, ["Portfolio weights text is empty."]
+
+    universe = {ticker.upper() for ticker in universe_etfs}
+    tokens = [token.strip() for token in raw_weights.split(",") if token.strip()]
+
+    for token in tokens:
+        if ":" not in token:
+            errors.append(f"Invalid token '{token}', expected ETF:weight format.")
+            continue
+
+        etf, value = token.split(":", 1)
+        etf_clean = etf.strip().upper()
+        if etf_clean not in universe:
+            errors.append(f"Unknown ETF '{etf_clean}' (not present in current universe).")
+            continue
+
+        try:
+            numeric_weight = float(value.strip())
+        except ValueError:
+            errors.append(f"Invalid numeric weight for '{etf_clean}'.")
+            continue
+
+        if numeric_weight <= 0:
+            errors.append(f"Weight for '{etf_clean}' must be strictly positive.")
+            continue
+
+        parsed[etf_clean] = numeric_weight
+
+    if not parsed:
+        errors.append("No valid positive weights were parsed.")
+    return parsed, errors
+
+
+def build_portfolio_risk_timeseries_figure(portfolio_series: pd.DataFrame) -> go.Figure:
+    """Create time-series chart for aggregate portfolio predicted TE."""
+    fig = go.Figure()
+
+    if not portfolio_series.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=portfolio_series["timestamp"],
+                y=portfolio_series["portfolio_predicted_te"] * 100.0,
+                mode="lines",
+                line={"color": "#103a6f", "width": 2},
+                name="Portfolio Predicted TE",
+            )
+        )
+
+    fig.update_layout(
+        title="Portfolio Predicted Tracking Error Over Time",
+        xaxis_title="Timestamp",
+        yaxis_title="Portfolio Predicted TE (%)",
+        template="plotly_white",
+        height=360,
+        margin={"l": 20, "r": 20, "t": 45, "b": 10},
+    )
+    return fig
+
+
+def build_sector_exposure_figure(sector_exposure: pd.DataFrame) -> go.Figure:
+    """Create sector exposure bar chart from ETF weight map."""
+    fig = go.Figure()
+
+    if not sector_exposure.empty:
+        fig.add_trace(
+            go.Bar(
+                x=sector_exposure["sector"],
+                y=sector_exposure["exposure_pct"],
+                marker={"color": "#d97a1f"},
+                name="Sector Exposure",
+            )
+        )
+
+    fig.update_layout(
+        title="Portfolio Sector Exposure",
+        xaxis_title="Sector",
+        yaxis_title="Exposure (%)",
+        template="plotly_white",
+        height=360,
+        margin={"l": 20, "r": 20, "t": 45, "b": 10},
     )
     return fig
 
@@ -678,13 +954,14 @@ def process_threshold_alerts(
         etf = str(row["etf_ticker"])
         pair = str(row["pair"])
         predicted_pct = float(row["predicted_error_pct"])
+        pair_threshold_pct = float(row.get("applied_alert_tracking_error_pct", threshold_pct))
 
         if not st.session_state.pair_alert_enabled.get(etf, True):
             # Reset the breach timer if alerting is disabled for the ETF.
             st.session_state.pair_breach_start.pop(pair, None)
             continue
 
-        above_threshold = abs(predicted_pct) >= threshold_pct
+        above_threshold = abs(predicted_pct) >= pair_threshold_pct
         breach_start = st.session_state.pair_breach_start.get(pair)
 
         if above_threshold and breach_start is None:
@@ -701,7 +978,7 @@ def process_threshold_alerts(
 
         reason = (
             f"Threshold breach: {pair} predicted tracking error {predicted_pct:.3f}% "
-            f"exceeded {threshold_pct:.3f}% for >= {persistence_minutes} minutes"
+            f"exceeded {pair_threshold_pct:.3f}% for >= {persistence_minutes} minutes"
         )
         subject = f"ETF Desk Alert | {pair} tracking error breach"
         body = (
@@ -792,6 +1069,30 @@ def main() -> None:
         horizon = st.number_input("Forecast Horizon (bars)", min_value=1, max_value=12, value=DEFAULT_HORIZON)
         rolling_window = st.number_input("Feature Rolling Window", min_value=10, max_value=120, value=DEFAULT_WINDOW)
         confidence_level = st.slider("Prediction Confidence Level", min_value=0.80, max_value=0.99, value=0.95)
+        portfolio_var_conf = st.slider(
+            "Portfolio VaR Confidence",
+            min_value=0.90,
+            max_value=0.99,
+            value=0.95,
+            step=0.01,
+            help="Confidence level used for historical VaR on portfolio tracking error.",
+        )
+        portfolio_var_lookback = st.number_input(
+            "Portfolio VaR Lookback (bars)",
+            min_value=60,
+            max_value=1000,
+            value=240,
+            step=20,
+        )
+
+        st.markdown("**Portfolio Weights**")
+        st.caption("Format: SPY:0.30, QQQ:0.25, FEZ:0.20, URTH:0.25")
+        default_weight_text = _default_portfolio_weight_text(sorted(PAIR_CONFIGS.keys()))
+        portfolio_weights_text = st.text_area(
+            "ETF Weights",
+            value=default_weight_text,
+            height=90,
+        )
 
         st.caption(
             f"Defaults: period={DEFAULT_INTRADAY_PERIOD if mode == 'Intraday' else DEFAULT_PERIOD}, "
@@ -861,6 +1162,15 @@ def main() -> None:
 
         latest_actuals = build_latest_actual_snapshot(rt_feature_panel)
 
+        regime_latest_map, regime_history_map = compute_latest_regime_map(
+            prediction_series=prediction_series,
+            feature_panel=rt_feature_panel,
+            rolling_window=int(rolling_window),
+            base_alert_tracking_error_pct=float(threshold_pct),
+            base_arbitrage_confidence_min=0.70,
+            base_anomaly_threshold=0.05,
+        )
+
         signal_generator = ArbitrageSignalGenerator(
             confidence_threshold=0.70,
             entry_tracking_error=0.0005,
@@ -874,12 +1184,14 @@ def main() -> None:
         universe_signals = signal_generator.generate_universe_signals(
             intraday_panel=market_panel,
             prediction_snapshot=latest_predictions,
+            regime_results=regime_latest_map,
         )
 
         anomaly_latest_map, anomaly_history_map = compute_latest_anomaly_map(
             prediction_series=prediction_series,
             feature_panel=rt_feature_panel,
             rolling_window=int(rolling_window),
+            regime_latest_map=regime_latest_map,
         )
 
     if latest_predictions.empty:
@@ -891,6 +1203,36 @@ def main() -> None:
         latest_actuals=latest_actuals,
         anomaly_latest_map=anomaly_latest_map,
         signal_table=universe_signals,
+    )
+
+    portfolio_weight_map, portfolio_weight_errors = parse_portfolio_weights(
+        raw_weights=portfolio_weights_text,
+        universe_etfs=sorted(live_overview["etf_ticker"].dropna().unique().tolist()),
+    )
+    portfolio_aggregator = PortfolioRiskAggregator(
+        var_confidence=float(portfolio_var_conf),
+        var_lookback=int(portfolio_var_lookback),
+    )
+    normalized_weight_map = portfolio_aggregator.normalize_weights(portfolio_weight_map)
+
+    portfolio_series = portfolio_aggregator.build_portfolio_prediction_series(
+        prediction_series=prediction_series,
+        latest_predictions=latest_predictions,
+        normalized_weights=normalized_weight_map,
+    )
+    portfolio_summary = portfolio_aggregator.summarize(
+        live_overview=live_overview,
+        portfolio_series=portfolio_series,
+        universe_signals=universe_signals,
+        normalized_weights=normalized_weight_map,
+    )
+    portfolio_contributions = portfolio_aggregator.compute_etf_contributions(
+        live_overview=live_overview,
+        normalized_weights=normalized_weight_map,
+    )
+    portfolio_sector_exposure = portfolio_aggregator.compute_sector_exposure(
+        normalized_weights=normalized_weight_map,
+        sector_map=ETF_SECTOR_MAP,
     )
 
     if st.session_state.selected_pair is None and not live_overview.empty:
@@ -945,9 +1287,25 @@ def main() -> None:
     selected_pair: str = label_to_pair[chosen_label]
     st.session_state.selected_pair = selected_pair
 
+    selected_regime_result = regime_latest_map.get(
+        selected_pair,
+        {
+            "current_regime": "Calm",
+            "confidence": 1.0,
+            "adaptive_thresholds": {
+                "alert_tracking_error": float(threshold_pct),
+                "arbitrage_confidence_min": 0.70,
+                "anomaly_reconstruction_threshold": 0.05,
+            },
+            "explanation": "No regime diagnostics available.",
+        },
+    )
+    selected_adaptive_thresholds = selected_regime_result.get("adaptive_thresholds", {})
+
     top_tabs = st.tabs(
         [
             "Real-Time Overview",
+            "Portfolio Risk",
             "Detailed ETF View",
             "Arbitrage Signal Panel",
             "Alerting System",
@@ -966,6 +1324,36 @@ def main() -> None:
         with m4:
             st.metric("Actionable Signals", f"{int((live_overview['action'] != 'HOLD').sum())}")
 
+        st.markdown("**Current Regime (Selected Pair)**")
+        regime_col_1, regime_col_2, regime_col_3 = st.columns([0.9, 1.2, 1.6])
+        with regime_col_1:
+            st.markdown(
+                regime_badge_html(str(selected_regime_result.get("current_regime", "Calm"))),
+                unsafe_allow_html=True,
+            )
+        with regime_col_2:
+            st.metric("Regime Confidence", f"{float(selected_regime_result.get('confidence', 0.0)):.2f}")
+        with regime_col_3:
+            st.caption(str(selected_regime_result.get("explanation", "")))
+
+        st.markdown("**Adaptive Thresholds (Selected Pair)**")
+        threshold_col_1, threshold_col_2, threshold_col_3 = st.columns(3)
+        with threshold_col_1:
+            st.metric(
+                "Alert TE Threshold",
+                f"{float(selected_adaptive_thresholds.get('alert_tracking_error', threshold_pct)):.3f}%",
+            )
+        with threshold_col_2:
+            st.metric(
+                "Arbitrage Confidence Min",
+                f"{float(selected_adaptive_thresholds.get('arbitrage_confidence_min', 0.70)):.2f}",
+            )
+        with threshold_col_3:
+            st.metric(
+                "Anomaly Sensitivity",
+                f"{float(selected_adaptive_thresholds.get('anomaly_reconstruction_threshold', 0.05)):.4f}",
+            )
+
         c1, c2 = st.columns([1.0, 1.4])
         with c1:
             st.plotly_chart(build_deviation_heatmap(live_overview), use_container_width=True)
@@ -983,6 +1371,8 @@ def main() -> None:
                 "confidence",
                 "recommended_shares",
                 "estimated_profit",
+                "regime",
+                "regime_confidence",
                 "pair",
             ]
             # Static color-coded table — selection is handled by the radio above the
@@ -1010,7 +1400,97 @@ def main() -> None:
         st.dataframe(style_live_table(top10_display), use_container_width=True)
 
     with top_tabs[1]:
+        st.subheader("Portfolio-Level Risk Aggregation")
+
+        if portfolio_weight_errors:
+            for message in portfolio_weight_errors:
+                st.warning(message)
+
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            st.metric("Portfolio Total Predicted TE", f"{portfolio_summary.total_predicted_te_pct:.3f}%")
+        with p2:
+            var_label = f"TE VaR ({int(float(portfolio_var_conf) * 100)}%)"
+            var_value = (
+                f"{portfolio_summary.portfolio_te_var_pct:.3f}%"
+                if pd.notna(portfolio_summary.portfolio_te_var_pct)
+                else "N/A"
+            )
+            st.metric(var_label, var_value)
+        with p3:
+            st.metric("Aggregate Arbitrage Risk", f"{portfolio_summary.aggregate_arbitrage_risk_score:.1f}")
+        with p4:
+            st.metric("Actionable Weight", f"{portfolio_summary.actionable_weight_pct:.1f}%")
+
+        pc1, pc2 = st.columns([1.3, 1.0])
+        with pc1:
+            st.plotly_chart(build_portfolio_risk_timeseries_figure(portfolio_series), use_container_width=True)
+        with pc2:
+            st.plotly_chart(build_sector_exposure_figure(portfolio_sector_exposure), use_container_width=True)
+
+        st.markdown("**ETF Contribution to Portfolio Risk**")
+        if portfolio_contributions.empty:
+            st.info("No portfolio contribution available. Verify ETF weights and data availability.")
+        else:
+            contribution_table = portfolio_contributions[
+                [
+                    "etf_ticker",
+                    "pair",
+                    "weight",
+                    "predicted_tracking_error",
+                    "risk_contribution_pct",
+                    "risk_bucket",
+                ]
+            ].copy()
+            contribution_table = contribution_table.rename(
+                columns={
+                    "weight": "portfolio_weight",
+                    "predicted_tracking_error": "predicted_te",
+                }
+            )
+            st.dataframe(
+                contribution_table.style.format(
+                    {
+                        "portfolio_weight": "{:.2%}",
+                        "predicted_te": "{:.4%}",
+                        "risk_contribution_pct": "{:.2f}%",
+                    }
+                ),
+                use_container_width=True,
+            )
+
+        st.markdown("**Normalized Portfolio Weights**")
+        st.write(normalized_weight_map if normalized_weight_map else {"info": "No valid normalized weights."})
+
+    with top_tabs[2]:
         st.subheader(f"Detailed View - {selected_pair}")
+
+        pair_regime_result = regime_latest_map.get(selected_pair, {})
+        pair_regime_history = regime_history_map.get(selected_pair, pd.DataFrame())
+
+        rc1, rc2 = st.columns([0.8, 1.2])
+        with rc1:
+            st.markdown("**Detected Regime**")
+            st.markdown(
+                regime_badge_html(str(pair_regime_result.get("current_regime", "Calm"))),
+                unsafe_allow_html=True,
+            )
+            st.metric("Confidence", f"{float(pair_regime_result.get('confidence', 0.0)):.2f}")
+            st.caption(str(pair_regime_result.get("explanation", "")))
+
+            regime_prob = pair_regime_result.get("regime_probability", {})
+            st.write(
+                {
+                    "Calm": round(float(regime_prob.get("Calm", 0.0)), 3),
+                    "Stress": round(float(regime_prob.get("Stress", 0.0)), 3),
+                    "High_Vol": round(float(regime_prob.get("High_Vol", 0.0)), 3),
+                }
+            )
+        with rc2:
+            st.plotly_chart(
+                build_regime_history_chart(pair_regime_history, pair_name=selected_pair),
+                use_container_width=True,
+            )
 
         residual_panel = _build_residual_panel(
             prediction_series=prediction_series,
@@ -1107,7 +1587,7 @@ def main() -> None:
             else:
                 st.info("Insufficient residual history for robust anomaly diagnostics.")
 
-    with top_tabs[2]:
+    with top_tabs[3]:
         st.subheader("Arbitrage Signal Panel")
 
         if universe_signals.empty:
@@ -1123,6 +1603,10 @@ def main() -> None:
                     "notional",
                     "estimated_profit",
                     "estimated_profit_bps",
+                    "regime",
+                    "regime_confidence",
+                    "applied_alert_tracking_error_pct",
+                    "applied_confidence_threshold",
                     "reason",
                 ]
             ].copy()
@@ -1141,6 +1625,9 @@ def main() -> None:
                         "recommended_size_usd": "${:,.0f}",
                         "estimated_profit": "${:,.0f}",
                         "estimated_profit_bps": "{:.1f}",
+                        "regime_confidence": "{:.2f}",
+                        "applied_alert_tracking_error_pct": "{:.3f}%",
+                        "applied_confidence_threshold": "{:.2f}",
                     }
                 ),
                 use_container_width=True,
@@ -1161,7 +1648,7 @@ def main() -> None:
                     st.metric("Estimated Profit", f"${float(signal['estimated_profit']):,.0f}")
                 st.caption(str(signal["reason"]))
 
-    with top_tabs[3]:
+    with top_tabs[4]:
         st.subheader("Alerting System")
 
         st.markdown("**Per-ETF Alert Enablement**")
@@ -1216,7 +1703,7 @@ def main() -> None:
         else:
             st.info("No alerts sent in this session.")
 
-    with top_tabs[4]:
+    with top_tabs[5]:
         st.subheader("Historical & Analytics")
 
         analytics_top = st.columns(2)

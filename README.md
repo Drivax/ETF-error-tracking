@@ -20,6 +20,7 @@ The platform is designed for bank risk management and trading workflows. It incl
 - Feature engineering for daily and intraday tracking behavior.
 - A predictive model for forward tracking error.
 - A signal engine for abnormal ETF-index dislocations.
+- Portfolio-level risk aggregation (total TE risk, TE VaR, sector exposure, ETF risk contribution).
 - Explainability outputs with SHAP and counterfactual analysis.
 - A Streamlit dashboard for analysts and risk managers.
 

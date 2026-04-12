@@ -12,6 +12,7 @@ Signal convention used by this implementation:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -32,6 +33,10 @@ class ArbitrageSignalOutput:
     predicted_tracking_error: float
     liquidity_score: float
     persistence_score: float
+    regime: str
+    regime_confidence: float
+    applied_alert_tracking_error_pct: float
+    applied_confidence_threshold: float
     reason: str
 
     def to_dict(self) -> dict[str, float | str | int | pd.Timestamp]:
@@ -48,6 +53,10 @@ class ArbitrageSignalOutput:
             "predicted_tracking_error": self.predicted_tracking_error,
             "liquidity_score": self.liquidity_score,
             "persistence_score": self.persistence_score,
+            "regime": self.regime,
+            "regime_confidence": self.regime_confidence,
+            "applied_alert_tracking_error_pct": self.applied_alert_tracking_error_pct,
+            "applied_confidence_threshold": self.applied_confidence_threshold,
             "reason": self.reason,
         }
 
@@ -91,9 +100,9 @@ class ArbitrageSignalGenerator:
         """Clip scalar to the [0, 1] interval."""
         return float(np.clip(value, 0.0, 1.0))
 
-    def _deviation_magnitude_score(self, predicted_tracking_error: float) -> float:
+    def _deviation_magnitude_score(self, predicted_tracking_error: float, entry_tracking_error: float) -> float:
         """Map TE magnitude to a confidence component in [0, 1]."""
-        scaled = abs(predicted_tracking_error) / self.entry_tracking_error
+        scaled = abs(predicted_tracking_error) / max(entry_tracking_error, 1e-8)
         # Saturate around 3x threshold to avoid overconfidence on extreme points.
         return self._clip_01(scaled / 3.0)
 
@@ -149,9 +158,10 @@ class ArbitrageSignalGenerator:
         predicted_tracking_error: float,
         historical_tracking_error: pd.Series | None,
         pair_panel: pd.DataFrame,
+        entry_tracking_error: float,
     ) -> tuple[float, float, float]:
         """Combine magnitude, persistence, and liquidity into final confidence."""
-        magnitude = self._deviation_magnitude_score(predicted_tracking_error)
+        magnitude = self._deviation_magnitude_score(predicted_tracking_error, entry_tracking_error=entry_tracking_error)
         persistence = self._persistence_score(predicted_tracking_error, historical_tracking_error)
         liquidity = self._liquidity_score(pair_panel)
 
@@ -176,18 +186,31 @@ class ArbitrageSignalGenerator:
         self,
         confidence: float,
         predicted_tracking_error: float,
+        confidence_threshold: float,
+        entry_tracking_error: float,
     ) -> float:
         """Size notional conservatively according to confidence and edge quality."""
-        if confidence < self.confidence_threshold:
+        if confidence < confidence_threshold:
             return 0.0
 
-        edge_intensity = self._clip_01(abs(predicted_tracking_error) / (2.5 * self.entry_tracking_error))
+        edge_intensity = self._clip_01(abs(predicted_tracking_error) / (2.5 * max(entry_tracking_error, 1e-8)))
         size_fraction = confidence * edge_intensity
         proposed_notional = self.max_notional * size_fraction
 
         if proposed_notional < self.min_notional:
             return 0.0
         return float(min(proposed_notional, self.max_notional))
+
+    @staticmethod
+    def _resolve_entry_tracking_error(alert_tracking_error: float) -> float:
+        """Normalize adaptive alert threshold to decimal TE units.
+
+        The regime detector returns alert threshold in percentage points.
+        Example: 0.65 means 0.65% and is converted to 0.0065.
+        """
+        if alert_tracking_error <= 0:
+            return 5e-4
+        return float(alert_tracking_error / 100.0)
 
     def generate_signal(
         self,
@@ -196,6 +219,8 @@ class ArbitrageSignalGenerator:
         predicted_tracking_error: float,
         historical_tracking_error: pd.Series | None = None,
         etf_price: float | None = None,
+        adaptive_thresholds: dict[str, float] | None = None,
+        regime_result: dict[str, Any] | None = None,
     ) -> ArbitrageSignalOutput:
         """Generate one conservative arbitrage signal for the latest timestamp.
 
@@ -223,15 +248,37 @@ class ArbitrageSignalGenerator:
                 raise ValueError("pair_panel must contain etf_close when etf_price is not provided")
             etf_price = float(pair_panel["etf_close"].iloc[-1])
 
+        regime = "Unknown"
+        regime_confidence = 0.0
+        active_confidence_threshold = float(self.confidence_threshold)
+        active_entry_tracking_error = float(self.entry_tracking_error)
+
+        if regime_result:
+            regime = str(regime_result.get("current_regime", regime))
+            regime_confidence = float(regime_result.get("confidence", regime_confidence))
+
+        if adaptive_thresholds:
+            if "arbitrage_confidence_min" in adaptive_thresholds:
+                active_confidence_threshold = float(
+                    np.clip(adaptive_thresholds["arbitrage_confidence_min"], 0.50, 0.99)
+                )
+            if "alert_tracking_error" in adaptive_thresholds:
+                active_entry_tracking_error = self._resolve_entry_tracking_error(
+                    float(adaptive_thresholds["alert_tracking_error"])
+                )
+
         confidence, persistence_score, liquidity_score = self._confidence(
             predicted_tracking_error=predicted_tracking_error,
             historical_tracking_error=historical_tracking_error,
             pair_panel=pair_panel,
+            entry_tracking_error=active_entry_tracking_error,
         )
 
         recommended_notional = self._recommended_notional(
             confidence=confidence,
             predicted_tracking_error=predicted_tracking_error,
+            confidence_threshold=active_confidence_threshold,
+            entry_tracking_error=active_entry_tracking_error,
         )
 
         estimated_profit, estimated_profit_bps = self._estimate_profit(
@@ -241,7 +288,7 @@ class ArbitrageSignalGenerator:
             slippage_bps=self.slippage_bps,
         )
 
-        if confidence < self.confidence_threshold or recommended_notional <= 0 or estimated_profit <= 0:
+        if confidence < active_confidence_threshold or recommended_notional <= 0 or estimated_profit <= 0:
             action = "HOLD"
             reason = (
                 "Signal below confidence or profit threshold; no capital allocation "
@@ -273,6 +320,10 @@ class ArbitrageSignalGenerator:
             predicted_tracking_error=float(predicted_tracking_error),
             liquidity_score=float(liquidity_score),
             persistence_score=float(persistence_score),
+            regime=regime,
+            regime_confidence=float(regime_confidence),
+            applied_alert_tracking_error_pct=float(active_entry_tracking_error * 100.0),
+            applied_confidence_threshold=float(active_confidence_threshold),
             reason=reason,
         )
 
@@ -280,6 +331,7 @@ class ArbitrageSignalGenerator:
         self,
         intraday_panel: pd.DataFrame,
         prediction_snapshot: pd.DataFrame,
+        regime_results: dict[str, dict[str, Any]] | None = None,
     ) -> pd.DataFrame:
         """Generate current arbitrage signals across all pairs.
 
@@ -300,6 +352,8 @@ class ArbitrageSignalGenerator:
             pair_panel_sorted["etf_ret"] = pair_panel_sorted["etf_close"].pct_change()
             pair_panel_sorted["benchmark_ret"] = pair_panel_sorted["benchmark_close"].pct_change()
             historical_te = (pair_panel_sorted["etf_ret"] - pair_panel_sorted["benchmark_ret"]).dropna()
+            pair_regime_result = regime_results.get(pair_name, {}) if regime_results else {}
+            pair_adaptive_thresholds = pair_regime_result.get("adaptive_thresholds")
 
             signal = self.generate_signal(
                 pair_panel=pair_panel_sorted,
@@ -307,6 +361,8 @@ class ArbitrageSignalGenerator:
                 predicted_tracking_error=float(latest_prediction["predicted_tracking_error"]),
                 historical_tracking_error=historical_te,
                 etf_price=float(pair_panel_sorted["etf_close"].iloc[-1]),
+                adaptive_thresholds=pair_adaptive_thresholds,
+                regime_result=pair_regime_result,
             )
             rows.append(signal.to_dict())
 

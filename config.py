@@ -15,6 +15,14 @@ PAIR_CONFIGS = {
     "URTH": "ACWI",
 }
 
+# Sector mapping for portfolio-level exposure rollups.
+ETF_SECTOR_MAP = {
+    "SPY": "US Broad Equity",
+    "QQQ": "US Technology Growth",
+    "FEZ": "Europe Large Cap",
+    "URTH": "Global Equity",
+}
+
 # Data retrieval defaults
 DEFAULT_PERIOD = "2y"
 DEFAULT_INTERVAL = "1d"
