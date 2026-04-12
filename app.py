@@ -1,8 +1,23 @@
-"""Streamlit dashboard for real-time ETF tracking error risk and arbitrage monitoring."""
+"""Production-grade Streamlit dashboard for ETF tracking error and arbitrage monitoring.
+
+This dashboard is designed for risk managers and ETF trading desks. It provides:
+1) Live tracking error monitoring across ETF-benchmark pairs.
+2) ETF-level drilldown with explainability and anomaly diagnostics.
+3) Arbitrage signal visibility with desk-ready sizing and PnL estimates.
+4) Configurable alerting (email and Slack) with a persisted in-session alert log.
+5) Historical analytics and model backtesting summaries.
+"""
 
 from __future__ import annotations
 
+import json
+import smtplib
+import ssl
+from datetime import timedelta
+from email.message import EmailMessage
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -29,11 +44,144 @@ from src.models import TrackingErrorModel
 from src.real_time_predictor import RealTimeTrackingErrorPredictor
 from src.utils import time_split
 
-st.set_page_config(page_title="ETF Real-Time Tracking Error Desk", layout="wide")
+
+st.set_page_config(
+    page_title="ETF Tracking Error & Arbitrage Desk",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# Visual thresholds used consistently for table highlights and risk badges.
+HIGH_DEVIATION_PCT = 0.80
+MODERATE_DEVIATION_PCT = 0.40
+
+
+def apply_global_styles() -> None:
+    """Inject desk-style CSS to provide a clean and modern visual layout.
+
+    Font strategy
+    -------------
+    The <link> tags below use the "media=print / onload" non-blocking pattern so the
+    browser never stalls page paint waiting for the CDN.  If the Google Fonts CDN is
+    unreachable (air-gapped networks, strict egress firewalls common in banks) the
+    font-family stacks fall through immediately to high-quality system fonts — no
+    layout shift, no blank text, no JS error.
+    """
+    # Non-blocking font loader: starts as media="print" (loads in background after
+    # first paint), then onload flips it to media="all" so the font is adopted.
+    # The <noscript> fallback serves environments with JS disabled.
+    st.markdown(
+        """
+        <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+        <link
+            rel="stylesheet"
+            href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap"
+            media="print"
+            onload="this.media='all'"
+        >
+        <noscript>
+          <link
+            rel="stylesheet"
+            href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap"
+          >
+        </noscript>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <style>
+            /*
+             * Font stack: Manrope is the preferred choice, loaded asynchronously above.
+             * The stack falls through to Inter, then OS-native UI fonts so the page is
+             * immediately readable even when the CDN is completely unreachable.
+             */
+            html, body, [class*="css"] {
+                font-family: 'Manrope', 'Inter', -apple-system, BlinkMacSystemFont,
+                             'Segoe UI', Helvetica, Arial, sans-serif;
+            }
+
+            :root {
+                --panel-bg: #f7f9fc;
+                --card-bg: #ffffff;
+                --accent: #103a6f;
+                --risk-high: #cf2e2e;
+                --risk-mid: #d97a1f;
+                --risk-low: #1d8a4c;
+            }
+
+            .stApp {
+                background:
+                    radial-gradient(circle at 15% 20%, rgba(16,58,111,0.08), transparent 32%),
+                    radial-gradient(circle at 85% 12%, rgba(217,122,31,0.08), transparent 30%),
+                    linear-gradient(180deg, #f5f7fb 0%, #eef3f9 100%);
+            }
+
+            .desk-panel {
+                background: var(--card-bg);
+                border: 1px solid rgba(16,58,111,0.08);
+                border-radius: 14px;
+                padding: 14px 16px;
+                box-shadow: 0 6px 20px rgba(15, 35, 75, 0.06);
+            }
+
+            .desk-title {
+                font-size: 1.7rem;
+                font-weight: 800;
+                color: #0f2646;
+                letter-spacing: 0.2px;
+            }
+
+            .desk-subtitle {
+                color: #4d5f7a;
+                font-size: 0.95rem;
+            }
+
+            /*
+             * Monospace stack: IBM Plex Mono preferred; Cascadia Code and Consolas
+             * are pre-installed on most Windows bank workstations; Courier New is
+             * the universal last-resort fallback.
+             */
+            .mono {
+                font-family: 'IBM Plex Mono', 'Cascadia Code', 'Consolas',
+                             'Courier New', monospace;
+            }
+
+            div[data-testid="stMetricValue"] {
+                color: #102e54;
+                font-weight: 800;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def initialize_session_state() -> None:
+    """Initialize all dashboard session keys exactly once."""
+    if "selected_pair" not in st.session_state:
+        st.session_state.selected_pair = None
+
+    if "alert_log" not in st.session_state:
+        # List of dictionaries with timestamp, ETF, channel, and reason.
+        st.session_state.alert_log = []
+
+    if "pair_alert_enabled" not in st.session_state:
+        st.session_state.pair_alert_enabled = {pair: True for pair in PAIR_CONFIGS}
+
+    if "pair_breach_start" not in st.session_state:
+        st.session_state.pair_breach_start = {}
+
+    if "alert_channel_backoff" not in st.session_state:
+        # Per-channel exponential back-off state, keyed by "{pair}::{channel}".
+        # Schema: {"fail_count": int, "next_retry_ts": pd.Timestamp | None}
+        st.session_state.alert_channel_backoff = {}
 
 
 def _get_interval_minutes(interval: str) -> int:
-    """Convert yfinance interval strings to minutes for display labels."""
+    """Convert yfinance interval strings to minutes for UI labels."""
     mapping = {
         "1m": 1,
         "2m": 2,
@@ -48,22 +196,22 @@ def _get_interval_minutes(interval: str) -> int:
     return mapping.get(interval, 5)
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def load_market_panel(period: str, interval: str) -> pd.DataFrame:
     """Fetch ETF-benchmark universe panel from Yahoo Finance."""
     loader = MarketDataLoader()
     return loader.fetch_universe(PAIR_CONFIGS, period=period, interval=interval)
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def build_feature_panel(data: pd.DataFrame, horizon: int, rolling_window: int) -> pd.DataFrame:
-    """Create model-ready feature panel with caching for dashboard responsiveness."""
+    """Create model-ready feature panel with caching for low-latency UX."""
     engineer = FeatureEngineer(rolling_window=rolling_window, horizon=horizon)
     return engineer.transform_universe(data)
 
 
 def load_or_train_model(feature_panel: pd.DataFrame, artifact_path: Path) -> TrackingErrorModel:
-    """Load persisted model artifact, or train quickly if no artifact exists yet."""
+    """Load model artifact, or train once if artifact does not exist."""
     if artifact_path.exists():
         return TrackingErrorModel.load(artifact_path)
 
@@ -79,11 +227,7 @@ def evaluate_backtest_metrics(
     model: TrackingErrorModel,
     test_size: float = 0.2,
 ) -> dict[str, float]:
-    """Compute current holdout metrics from the latest feature panel.
-
-    This mirrors the project's time-based validation protocol and lets the app show
-    up-to-date model quality after retraining or data refresh.
-    """
+    """Compute holdout metrics from the latest transformed panel."""
     target_col = "target_te"
     if target_col not in feature_panel.columns:
         return {}
@@ -107,7 +251,7 @@ def evaluate_backtest_metrics(
 
     rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
     mae = float(np.mean(np.abs(y_test - y_pred)))
-    mape = float(np.mean(np.abs((y_test - y_pred) / (np.abs(y_test) + 1e-8))) )
+    mape = float(np.mean(np.abs((y_test - y_pred) / (np.abs(y_test) + 1e-8))))
     r2 = float(1 - np.sum((y_test - y_pred) ** 2) / (np.sum((y_test - np.mean(y_test)) ** 2) + 1e-12))
 
     return {
@@ -120,7 +264,7 @@ def evaluate_backtest_metrics(
 
 
 def _build_shap_waterfall_figure(shap_df: pd.DataFrame, top_features: int = 10) -> go.Figure:
-    """Render a compact SHAP waterfall-style chart for one prediction."""
+    """Build compact SHAP waterfall chart for desk users."""
     ranked = shap_df.head(top_features).copy()
     ranked = ranked.sort_values("shap_value", ascending=False)
 
@@ -131,16 +275,17 @@ def _build_shap_waterfall_figure(shap_df: pd.DataFrame, top_features: int = 10) 
             measure=["relative"] * len(ranked),
             x=ranked["feature"].tolist(),
             y=ranked["shap_value"].tolist(),
-            connector={"line": {"color": "rgba(60, 60, 60, 0.4)"}},
+            connector={"line": {"color": "rgba(50, 50, 50, 0.35)"}},
         )
     )
 
     fig.update_layout(
-        title="SHAP Waterfall (Top Feature Contributions)",
+        title="Latest Prediction - SHAP Waterfall",
         xaxis_title="Feature",
         yaxis_title="Contribution to Predicted Tracking Error",
         template="plotly_white",
         height=420,
+        margin={"l": 30, "r": 20, "t": 50, "b": 10},
     )
     return fig
 
@@ -150,11 +295,7 @@ def _build_residual_panel(
     feature_panel: pd.DataFrame,
     pair_name: str,
 ) -> pd.DataFrame:
-    """Join predictions with realized/target TE to compute residual history.
-
-    The anomaly detector expects residuals defined as:
-    residual = actual_tracking_error - predicted_tracking_error
-    """
+    """Join predictions with realized/target TE to compute residual history."""
     pair_predictions = prediction_series[prediction_series["pair"] == pair_name].copy()
     if pair_predictions.empty:
         return pd.DataFrame()
@@ -163,7 +304,6 @@ def _build_residual_panel(
     if pair_actuals.empty:
         return pd.DataFrame()
 
-    # Prefer predictive target when available; otherwise fallback to realized TE.
     pair_actuals = pair_actuals.reset_index().rename(columns={"index": "timestamp"})
     pair_actuals["actual_tracking_error"] = pair_actuals["target_te"].where(
         pair_actuals["target_te"].notna(),
@@ -171,7 +311,15 @@ def _build_residual_panel(
     )
 
     merged = pair_predictions.merge(
-        pair_actuals[["timestamp", "actual_tracking_error"]],
+        pair_actuals[
+            [
+                "timestamp",
+                "actual_tracking_error",
+                "etf_ticker",
+                "benchmark_ticker",
+                "realized_te",
+            ]
+        ],
         on="timestamp",
         how="left",
     )
@@ -183,19 +331,455 @@ def _build_residual_panel(
     return merged.sort_values("timestamp").reset_index(drop=True)
 
 
+def compute_latest_anomaly_map(
+    prediction_series: pd.DataFrame,
+    feature_panel: pd.DataFrame,
+    rolling_window: int,
+) -> tuple[dict[str, dict[str, object]], dict[str, pd.DataFrame]]:
+    """Compute latest anomaly status and full anomaly history per pair."""
+    latest_by_pair: dict[str, dict[str, object]] = {}
+    history_by_pair: dict[str, pd.DataFrame] = {}
+
+    detector_short_window = max(10, int(rolling_window // 2))
+    detector_long_window = max(24, int(rolling_window * 2))
+    required_observations = max(80, detector_long_window * 2)
+
+    for pair_name in prediction_series["pair"].unique().tolist():
+        residual_panel = _build_residual_panel(
+            prediction_series=prediction_series,
+            feature_panel=feature_panel,
+            pair_name=pair_name,
+        )
+
+        if len(residual_panel) < required_observations:
+            latest_by_pair[pair_name] = {
+                "anomaly_detected": False,
+                "confidence": 0.0,
+                "anomaly_type": "insufficient_history",
+                "score": 0.0,
+                "explanation": (
+                    "Insufficient aligned residual history for robust anomaly detection "
+                    f"(required {required_observations}, available {len(residual_panel)})."
+                ),
+                "recommended_action": "Monitor",
+            }
+            history_by_pair[pair_name] = pd.DataFrame()
+            continue
+
+        detector = ResidualAnomalyDetector(
+            short_window=detector_short_window,
+            long_window=detector_long_window,
+            contamination=0.05,
+            normal_quantile=0.85,
+            random_state=42,
+        )
+
+        scored = detector.fit_score(
+            actual_tracking_error=residual_panel["actual_tracking_error"],
+            predicted_tracking_error=residual_panel["predicted_tracking_error"],
+        )
+        latest = detector.latest_result(
+            actual_tracking_error=residual_panel["actual_tracking_error"],
+            predicted_tracking_error=residual_panel["predicted_tracking_error"],
+        )
+
+        latest_by_pair[pair_name] = latest
+        history_by_pair[pair_name] = scored
+
+    return latest_by_pair, history_by_pair
+
+
+def build_latest_actual_snapshot(feature_panel: pd.DataFrame) -> pd.DataFrame:
+    """Create one-row-per-pair snapshot with latest realized and target TE."""
+    rows = []
+    for pair_name, pair_df in feature_panel.groupby("pair", observed=True):
+        latest = pair_df.sort_index().tail(1).copy()
+        if latest.empty:
+            continue
+
+        actual_te = latest["target_te"].iloc[0]
+        if pd.isna(actual_te):
+            actual_te = latest["realized_te"].iloc[0]
+
+        rows.append(
+            {
+                "pair": pair_name,
+                "timestamp": latest.index[-1],
+                "etf_ticker": str(latest["etf_ticker"].iloc[0]),
+                "benchmark_ticker": str(latest["benchmark_ticker"].iloc[0]),
+                "actual_tracking_error": float(actual_te) if pd.notna(actual_te) else np.nan,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def classify_risk_bucket(predicted_error_pct: float) -> str:
+    """Convert predicted error percentage into qualitative risk bucket."""
+    abs_val = abs(predicted_error_pct)
+    if abs_val >= HIGH_DEVIATION_PCT:
+        return "High"
+    if abs_val >= MODERATE_DEVIATION_PCT:
+        return "Moderate"
+    return "Normal"
+
+
+def build_live_overview_table(
+    latest_predictions: pd.DataFrame,
+    latest_actuals: pd.DataFrame,
+    anomaly_latest_map: dict[str, dict[str, object]],
+    signal_table: pd.DataFrame,
+) -> pd.DataFrame:
+    """Assemble the master live table consumed by overview and alert modules."""
+    merged = latest_predictions.merge(
+        latest_actuals[["pair", "etf_ticker", "benchmark_ticker", "actual_tracking_error"]],
+        on="pair",
+        how="left",
+    )
+
+    if signal_table.empty:
+        signal_cols = pd.DataFrame(columns=["pair", "action", "confidence", "recommended_shares", "estimated_profit"])
+    else:
+        signal_cols = signal_table[["pair", "action", "confidence", "recommended_shares", "estimated_profit"]].copy()
+
+    merged = merged.merge(signal_cols, on="pair", how="left")
+
+    merged["predicted_error_pct"] = merged["predicted_tracking_error"] * 100.0
+    merged["actual_error_pct"] = merged["actual_tracking_error"] * 100.0
+
+    merged["anomaly_flag"] = merged["pair"].apply(
+        lambda pair: bool(anomaly_latest_map.get(pair, {}).get("anomaly_detected", False))
+    )
+    merged["anomaly_type"] = merged["pair"].apply(
+        lambda pair: str(anomaly_latest_map.get(pair, {}).get("anomaly_type", "none"))
+    )
+    merged["risk_bucket"] = merged["predicted_error_pct"].apply(classify_risk_bucket)
+
+    # Use HOLD as default when no generated signal exists for a pair.
+    merged["action"] = merged["action"].fillna("HOLD")
+    merged["confidence"] = merged["confidence"].fillna(0.0)
+    merged["recommended_shares"] = merged["recommended_shares"].fillna(0).astype(int)
+    merged["estimated_profit"] = merged["estimated_profit"].fillna(0.0)
+
+    merged = merged.sort_values("predicted_error_pct", ascending=False).reset_index(drop=True)
+    return merged
+
+
+def style_live_table(table: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """Apply risk-based color encoding for desk readability."""
+
+    def row_style(row: pd.Series) -> list[str]:
+        color = ""
+        if row["risk_bucket"] == "High":
+            color = "background-color: rgba(207, 46, 46, 0.16);"
+        elif row["risk_bucket"] == "Moderate":
+            color = "background-color: rgba(217, 122, 31, 0.16);"
+        else:
+            color = "background-color: rgba(29, 138, 76, 0.12);"
+        return [color] * len(row)
+
+    formatters = {
+        "predicted_error_pct": "{:.3f}%",
+        "actual_error_pct": "{:.3f}%",
+        "confidence": "{:.2f}",
+        "estimated_profit": "${:,.0f}",
+    }
+    valid_formatters = {key: value for key, value in formatters.items() if key in table.columns}
+
+    return table.style.apply(row_style, axis=1).format(valid_formatters)
+
+
+def build_deviation_heatmap(table: pd.DataFrame) -> go.Figure:
+    """Create heatmap that ranks ETFs by current predicted tracking error."""
+    ranked = table[["pair", "predicted_error_pct"]].copy()
+    ranked = ranked.sort_values("predicted_error_pct", ascending=False)
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=ranked[["predicted_error_pct"]].to_numpy(),
+            x=["Predicted TE (%)"],
+            y=ranked["pair"].tolist(),
+            colorscale=[
+                [0.0, "#1d8a4c"],
+                [0.5, "#d97a1f"],
+                [1.0, "#cf2e2e"],
+            ],
+            zmin=min(-HIGH_DEVIATION_PCT, float(ranked["predicted_error_pct"].min())),
+            zmax=max(HIGH_DEVIATION_PCT, float(ranked["predicted_error_pct"].max())),
+            colorbar={"title": "TE (%)"},
+            hovertemplate="ETF Pair: %{y}<br>Predicted TE: %{z:.3f}%<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="Live ETF Tracking Error Heatmap (Highest Deviations First)",
+        template="plotly_white",
+        height=max(300, 70 * len(ranked)),
+        margin={"l": 20, "r": 20, "t": 50, "b": 15},
+    )
+    return fig
+
+
+def build_history_chart(
+    pair_name: str,
+    intraday_residual_panel: pd.DataFrame,
+    daily_feature_panel: pd.DataFrame,
+) -> go.Figure:
+    """Build combined 30-day daily + intraday chart for selected ETF pair."""
+    fig = go.Figure()
+
+    pair_daily = daily_feature_panel[daily_feature_panel["pair"] == pair_name].copy().sort_index()
+    pair_daily = pair_daily.tail(30)
+
+    if not pair_daily.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=pair_daily.index,
+                y=pair_daily["realized_te"] * 100.0,
+                mode="lines+markers",
+                name="Realized TE (Daily, last 30d)",
+                line={"color": "#103a6f", "width": 2},
+                marker={"size": 4},
+            )
+        )
+
+    if not intraday_residual_panel.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=intraday_residual_panel["timestamp"],
+                y=intraday_residual_panel["predicted_tracking_error"] * 100.0,
+                mode="lines",
+                name="Predicted TE (Intraday)",
+                line={"color": "#d97a1f", "width": 2},
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=intraday_residual_panel["timestamp"],
+                y=intraday_residual_panel["actual_tracking_error"] * 100.0,
+                mode="lines",
+                name="Actual TE (Intraday proxy)",
+                line={"color": "#1d8a4c", "width": 2, "dash": "dot"},
+            )
+        )
+
+    fig.update_layout(
+        title=f"{pair_name}: Tracking Error (30-Day + Intraday)",
+        xaxis_title="Timestamp",
+        yaxis_title="Tracking Error (%)",
+        template="plotly_white",
+        height=460,
+        margin={"l": 20, "r": 20, "t": 50, "b": 10},
+    )
+    return fig
+
+
+def send_email_alert(config: dict[str, object], subject: str, body: str) -> tuple[bool, str]:
+    """Send one email alert through SMTP; returns success status and message."""
+    if not config.get("email_enabled"):
+        return False, "Email channel disabled"
+
+    required = ["smtp_host", "smtp_port", "username", "password", "from_email", "to_email"]
+    if any(not config.get(field) for field in required):
+        return False, "Missing SMTP/email configuration fields"
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = str(config["from_email"])
+    message["To"] = str(config["to_email"])
+    message.set_content(body)
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(str(config["smtp_host"]), int(config["smtp_port"])) as smtp:
+            smtp.starttls(context=context)
+            smtp.login(str(config["username"]), str(config["password"]))
+            smtp.send_message(message)
+        return True, "Email sent"
+    except Exception as exc:  # pragma: no cover - network dependent
+        return False, f"Email send failed: {exc}"
+
+
+def send_slack_alert(config: dict[str, object], body: str) -> tuple[bool, str]:
+    """Send one Slack alert via incoming webhook URL."""
+    if not config.get("slack_enabled"):
+        return False, "Slack channel disabled"
+
+    webhook_url = str(config.get("slack_webhook_url", "")).strip()
+    if not webhook_url:
+        return False, "Missing Slack webhook URL"
+
+    payload = json.dumps({"text": body}).encode("utf-8")
+    request = Request(
+        webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=8) as response:  # noqa: S310
+            status_ok = 200 <= response.status < 300
+        return status_ok, "Slack sent" if status_ok else f"Slack returned status {response.status}"
+    except URLError as exc:  # pragma: no cover - network dependent
+        return False, f"Slack send failed: {exc}"
+
+
+# ── Alert rate-limiting / exponential back-off ───────────────────────────────
+# Email and Slack channels are tracked independently and per ETF pair.
+# After the first delivery failure the channel is silenced for BASE_BACKOFF_SECONDS.
+# Each subsequent failure doubles the wait time, capped at MAX_BACKOFF_SECONDS.
+# A successful delivery resets the counter immediately.
+_ALERT_BASE_BACKOFF_SECONDS: int = 60      # 1 minute on first failure
+_ALERT_MAX_BACKOFF_SECONDS: int = 1_800   # cap: 30 minutes
+
+
+def _alert_channel_key(pair: str, channel: str) -> str:
+    """Compose a session-state key scoped to one ETF pair and delivery channel."""
+    return f"{pair}::{channel}"
+
+
+def _channel_in_backoff(channel_key: str, now_ts: pd.Timestamp) -> bool:
+    """Return True when the channel is inside its current back-off window."""
+    state = st.session_state.alert_channel_backoff.get(channel_key)
+    if state is None:
+        return False
+    next_retry: pd.Timestamp | None = state.get("next_retry_ts")
+    return next_retry is not None and now_ts < next_retry
+
+
+def _record_channel_failure(channel_key: str, now_ts: pd.Timestamp) -> None:
+    """Increment failure counter and schedule next retry with exponential back-off."""
+    state = st.session_state.alert_channel_backoff.setdefault(
+        channel_key, {"fail_count": 0, "next_retry_ts": None}
+    )
+    state["fail_count"] += 1
+    backoff_seconds = min(
+        _ALERT_BASE_BACKOFF_SECONDS * (2 ** (state["fail_count"] - 1)),
+        _ALERT_MAX_BACKOFF_SECONDS,
+    )
+    state["next_retry_ts"] = now_ts + timedelta(seconds=backoff_seconds)
+
+
+def _record_channel_success(channel_key: str) -> None:
+    """Reset back-off after a successful send so future alerts fire immediately."""
+    st.session_state.alert_channel_backoff.pop(channel_key, None)
+
+
+def process_threshold_alerts(
+    live_table: pd.DataFrame,
+    alert_config: dict[str, object],
+    now_ts: pd.Timestamp,
+) -> None:
+    """Evaluate threshold/persistence alert conditions and dispatch notifications."""
+    threshold_pct = float(alert_config["threshold_pct"])
+    persistence_minutes = int(alert_config["persistence_minutes"])
+
+    for _, row in live_table.iterrows():
+        etf = str(row["etf_ticker"])
+        pair = str(row["pair"])
+        predicted_pct = float(row["predicted_error_pct"])
+
+        if not st.session_state.pair_alert_enabled.get(etf, True):
+            # Reset the breach timer if alerting is disabled for the ETF.
+            st.session_state.pair_breach_start.pop(pair, None)
+            continue
+
+        above_threshold = abs(predicted_pct) >= threshold_pct
+        breach_start = st.session_state.pair_breach_start.get(pair)
+
+        if above_threshold and breach_start is None:
+            st.session_state.pair_breach_start[pair] = now_ts
+            continue
+
+        if not above_threshold:
+            st.session_state.pair_breach_start.pop(pair, None)
+            continue
+
+        elapsed = now_ts - breach_start if breach_start is not None else timedelta(minutes=0)
+        if elapsed < timedelta(minutes=persistence_minutes):
+            continue
+
+        reason = (
+            f"Threshold breach: {pair} predicted tracking error {predicted_pct:.3f}% "
+            f"exceeded {threshold_pct:.3f}% for >= {persistence_minutes} minutes"
+        )
+        subject = f"ETF Desk Alert | {pair} tracking error breach"
+        body = (
+            f"{reason}\n"
+            f"Action: {row['action']}\n"
+            f"Signal Confidence: {float(row['confidence']):.2f}\n"
+            f"Anomaly Flag: {bool(row['anomaly_flag'])}\n"
+            f"Timestamp: {now_ts}"
+        )
+
+        email_key = _alert_channel_key(pair, "email")
+        slack_key = _alert_channel_key(pair, "slack")
+
+        # --- Email delivery with back-off gate ----------------------------------
+        if _channel_in_backoff(email_key, now_ts):
+            # Channel is in a back-off window; skip without logging a failure.
+            email_ok, email_msg = False, "email rate-limited (back-off active)"
+        else:
+            email_ok, email_msg = send_email_alert(alert_config, subject=subject, body=body)
+            if email_ok:
+                _record_channel_success(email_key)
+            elif "disabled" not in email_msg:
+                # Back-off only on genuine delivery failures, not intentional disables.
+                _record_channel_failure(email_key, now_ts)
+
+        # --- Slack delivery with back-off gate ----------------------------------
+        if _channel_in_backoff(slack_key, now_ts):
+            slack_ok, slack_msg = False, "slack rate-limited (back-off active)"
+        else:
+            slack_ok, slack_msg = send_slack_alert(alert_config, body=body)
+            if slack_ok:
+                _record_channel_success(slack_key)
+            elif "disabled" not in slack_msg:
+                _record_channel_failure(slack_key, now_ts)
+
+        for channel, ok, status in [
+            ("email", email_ok, email_msg),
+            ("slack", slack_ok, slack_msg),
+        ]:
+            if not ok:
+                continue
+            st.session_state.alert_log.append(
+                {
+                    "timestamp": now_ts,
+                    "pair": pair,
+                    "etf": etf,
+                    "channel": channel,
+                    "reason": reason,
+                    "status": status,
+                }
+            )
+
+        # Advance the breach timer only after a confirmed send so the persistence
+        # window is re-evaluated from the actual last-delivered timestamp.
+        if email_ok or slack_ok:
+            st.session_state.pair_breach_start[pair] = now_ts
+
+
 def main() -> None:
-    """Render dashboard with real-time prediction, explainability, and arbitrage panels."""
-    st.title("ETF Intraday Tracking Error Intelligence")
-    st.caption("Production-style monitoring for ETF risk and trading desks")
+    """Render the complete dashboard."""
+    apply_global_styles()
+    initialize_session_state()
+
+    st.markdown("<div class='desk-title'>ETF Tracking Error Prediction & Arbitrage Desk</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='desk-subtitle'>Live surveillance for risk managers and ETF trading desks.</div>",
+        unsafe_allow_html=True,
+    )
 
     with st.sidebar:
-        st.subheader("Run Configuration")
+        st.header("Configuration")
 
+        st.subheader("Data & Model")
         mode = st.selectbox(
             "Data Mode",
             ["Intraday", "Daily"],
             index=0,
-            help="Intraday mode supports 5-15 minute monitoring cycles.",
+            help="Intraday is intended for desk monitoring every 5-15 minutes.",
         )
 
         if mode == "Intraday":
@@ -209,19 +793,50 @@ def main() -> None:
         rolling_window = st.number_input("Feature Rolling Window", min_value=10, max_value=120, value=DEFAULT_WINDOW)
         confidence_level = st.slider("Prediction Confidence Level", min_value=0.80, max_value=0.99, value=0.95)
 
-        intraday_default_period = DEFAULT_INTRADAY_PERIOD if mode == "Intraday" else DEFAULT_PERIOD
-        intraday_default_interval = DEFAULT_INTRADAY_INTERVAL if mode == "Intraday" else DEFAULT_INTERVAL
         st.caption(
-            f"Config defaults: period={intraday_default_period}, interval={intraday_default_interval}"
+            f"Defaults: period={DEFAULT_INTRADAY_PERIOD if mode == 'Intraday' else DEFAULT_PERIOD}, "
+            f"interval={DEFAULT_INTRADAY_INTERVAL if mode == 'Intraday' else DEFAULT_INTERVAL}"
         )
 
-        run_button = st.button("Run Real-Time Desk")
+        st.divider()
+        st.subheader("Alerting")
+        auto_alerts_enabled = st.toggle("Enable Alert Engine", value=False)
+        threshold_pct = st.number_input(
+            "Tracking Error Threshold (%)",
+            min_value=0.05,
+            max_value=5.00,
+            value=0.80,
+            step=0.05,
+            help="Trigger condition uses absolute predicted tracking error percentage.",
+        )
+        persistence_minutes = st.number_input(
+            "Persistence (minutes)",
+            min_value=1,
+            max_value=240,
+            value=15,
+            step=1,
+        )
+
+        st.markdown("**Email Settings**")
+        email_enabled = st.toggle("Enable Email Alerts", value=False)
+        smtp_host = st.text_input("SMTP Host", value="")
+        smtp_port = st.number_input("SMTP Port", min_value=1, max_value=65535, value=587)
+        smtp_user = st.text_input("SMTP Username", value="")
+        smtp_password = st.text_input("SMTP Password", type="password", value="")
+        from_email = st.text_input("From Email", value="")
+        to_email = st.text_input("To Email", value="")
+
+        st.markdown("**Slack Settings**")
+        slack_enabled = st.toggle("Enable Slack Alerts", value=False)
+        slack_webhook_url = st.text_input("Slack Webhook URL", type="password", value="")
+
+        run_button = st.button("Run / Refresh Dashboard", use_container_width=True)
 
     if not run_button:
-        st.info("Select parameters and click 'Run Real-Time Desk' to refresh predictions.")
+        st.info("Configure settings in the sidebar, then click 'Run / Refresh Dashboard'.")
         return
 
-    with st.spinner("Loading market panel and running forecasting pipeline..."):
+    with st.spinner("Loading market data, refreshing model outputs, and computing diagnostics..."):
         market_panel = load_market_panel(period=period, interval=interval)
         feature_panel = build_feature_panel(data=market_panel, horizon=int(horizon), rolling_window=int(rolling_window))
         model = load_or_train_model(feature_panel=feature_panel, artifact_path=Path(MODEL_ARTIFACT_PATH))
@@ -244,281 +859,435 @@ def main() -> None:
             confidence_window=120,
         )
 
+        latest_actuals = build_latest_actual_snapshot(rt_feature_panel)
+
+        signal_generator = ArbitrageSignalGenerator(
+            confidence_threshold=0.70,
+            entry_tracking_error=0.0005,
+            max_notional=1_500_000.0,
+            min_notional=100_000.0,
+            transaction_cost_bps=3.0,
+            slippage_bps=2.0,
+            persistence_window=max(6, ARBITRAGE_WINDOW // 10),
+            liquidity_window=12,
+        )
+        universe_signals = signal_generator.generate_universe_signals(
+            intraday_panel=market_panel,
+            prediction_snapshot=latest_predictions,
+        )
+
+        anomaly_latest_map, anomaly_history_map = compute_latest_anomaly_map(
+            prediction_series=prediction_series,
+            feature_panel=rt_feature_panel,
+            rolling_window=int(rolling_window),
+        )
+
     if latest_predictions.empty:
-        st.warning("No valid rows available for real-time scoring.")
+        st.warning("No valid rows available for real-time scoring. Check data availability and selected mode.")
         return
 
-    st.subheader("Live Tracking Error Snapshot")
-    st.dataframe(latest_predictions, use_container_width=True)
-
-    backtest_metrics = evaluate_backtest_metrics(feature_panel=feature_panel, model=model)
-    if backtest_metrics:
-        st.subheader("Latest Backtest Results")
-        metric_a, metric_b, metric_c, metric_d, metric_e = st.columns(5)
-        with metric_a:
-            st.metric("MAE", f"{backtest_metrics['mae']:.6f}")
-        with metric_b:
-            st.metric("RMSE", f"{backtest_metrics['rmse']:.6f}")
-        with metric_c:
-            st.metric("MAPE", f"{backtest_metrics['mape']:.4f}")
-        with metric_d:
-            st.metric("R2", f"{backtest_metrics['r2']:.4f}")
-        with metric_e:
-            st.metric("Scored Rows", f"{int(backtest_metrics['scored_rows'])}")
-
-    selected_pair = st.selectbox("Select Pair", latest_predictions["pair"].tolist())
-    selected_series = prediction_series[prediction_series["pair"] == selected_pair].copy()
-    selected_series = selected_series.sort_values("timestamp")
-
-    if not selected_series.empty:
-        chart = go.Figure()
-        chart.add_trace(
-            go.Scatter(
-                x=selected_series["timestamp"],
-                y=selected_series["predicted_tracking_error"],
-                mode="lines",
-                name="Predicted TE",
-                line={"color": "#1f77b4", "width": 2},
-            )
-        )
-        chart.add_trace(
-            go.Scatter(
-                x=selected_series["timestamp"],
-                y=selected_series["ci_upper"],
-                mode="lines",
-                line={"width": 0},
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
-        chart.add_trace(
-            go.Scatter(
-                x=selected_series["timestamp"],
-                y=selected_series["ci_lower"],
-                mode="lines",
-                line={"width": 0},
-                fill="tonexty",
-                fillcolor="rgba(31, 119, 180, 0.15)",
-                name=f"{int(confidence_level * 100)}% CI",
-            )
-        )
-
-        chart.update_layout(
-            title=f"{selected_pair}: Predicted Tracking Error every {_get_interval_minutes(interval)} minutes",
-            xaxis_title="Timestamp",
-            yaxis_title="Tracking Error",
-            template="plotly_white",
-            height=420,
-        )
-        st.plotly_chart(chart, use_container_width=True)
-
-    st.subheader("Anomaly Detection Panel")
-    residual_panel = _build_residual_panel(
-        prediction_series=prediction_series,
-        feature_panel=rt_feature_panel,
-        pair_name=selected_pair,
+    live_overview = build_live_overview_table(
+        latest_predictions=latest_predictions,
+        latest_actuals=latest_actuals,
+        anomaly_latest_map=anomaly_latest_map,
+        signal_table=universe_signals,
     )
 
-    detector_short_window = max(10, int(rolling_window // 2))
-    detector_long_window = max(24, int(rolling_window * 2))
-    required_observations = max(80, detector_long_window * 2)
+    if st.session_state.selected_pair is None and not live_overview.empty:
+        st.session_state.selected_pair = str(live_overview.iloc[0]["pair"])
 
-    if len(residual_panel) < required_observations:
-        st.info(
-            "Not enough residual history for robust structural anomaly detection. "
-            f"Need at least {required_observations} aligned observations for the current "
-            f"window settings (available: {len(residual_panel)})."
+    # ── Pair selector (persistent across all tabs, rendered before tabs) ───────────
+    # Placing the selector ABOVE st.tabs() avoids the Streamlit ordering problem
+    # where tab content executes before outside widgets on every rerun.  This
+    # guarantees that `selected_pair` is settled before any tab body reads it.
+    #
+    # st.radio is used instead of a dataframe row-click because:
+    # - st.radio works identically on every Streamlit version.
+    # - It requires no version-conditional try/except guards.
+    # - Its return value is always the user’s latest choice, resolving on the
+    #   same rerun that triggered the interaction (no off-by-one lag).
+    pair_options: list[str] = live_overview["pair"].tolist()
+    current_pair: str = (
+        st.session_state.selected_pair
+        if st.session_state.selected_pair in pair_options
+        else pair_options[0]
+    )
+
+    # Build human-readable radio labels: risk badge + tickers + latest predicted TE.
+    risk_icon = {"High": "🔴", "Moderate": "🟡", "Normal": "🟢"}
+    radio_labels: list[str] = [
+        (
+            f"{risk_icon.get(str(row['risk_bucket']), '⚪')}  "
+            f"{row['etf_ticker']} / {row['benchmark_ticker']}  |"
+            f"  TE {float(row['predicted_error_pct']):.3f}%  [{row['action']}]"
         )
-    else:
-        detector = ResidualAnomalyDetector(
-            short_window=detector_short_window,
-            long_window=detector_long_window,
-            contamination=0.05,
-            normal_quantile=0.85,
-            random_state=42,
-        )
+        for _, row in live_overview.iterrows()
+    ]
+    # Reverse-mapping so we resolve the chosen label back to a canonical pair name.
+    label_to_pair: dict[str, str] = {
+        label: str(row["pair"])
+        for label, (_, row) in zip(radio_labels, live_overview.iterrows())
+    }
+    default_radio_index: int = (
+        list(label_to_pair.values()).index(current_pair)
+        if current_pair in label_to_pair.values()
+        else 0
+    )
+    # `index=default_radio_index` (not a key) ensures the radio always reflects
+    # session_state on every rerun, whichever widget was last interacted with.
+    chosen_label: str = st.radio(
+        "ETF Pair",
+        options=radio_labels,
+        index=default_radio_index,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    selected_pair: str = label_to_pair[chosen_label]
+    st.session_state.selected_pair = selected_pair
 
-        anomaly_scored = detector.fit_score(
-            actual_tracking_error=residual_panel["actual_tracking_error"],
-            predicted_tracking_error=residual_panel["predicted_tracking_error"],
-        )
-        latest_anomaly = detector.latest_result(
-            actual_tracking_error=residual_panel["actual_tracking_error"],
-            predicted_tracking_error=residual_panel["predicted_tracking_error"],
-        )
+    top_tabs = st.tabs(
+        [
+            "Real-Time Overview",
+            "Detailed ETF View",
+            "Arbitrage Signal Panel",
+            "Alerting System",
+            "Historical & Analytics",
+        ]
+    )
 
-        anomaly_plot_data = residual_panel.copy()
-        aligned_scores = anomaly_scored.reset_index().rename(columns={"index": "timestamp"})
-        anomaly_plot_data = anomaly_plot_data.merge(
-            aligned_scores[["timestamp", "anomaly_detected", "confidence", "anomaly_type"]],
-            on="timestamp",
-            how="left",
-        )
+    with top_tabs[0]:
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("Tracked ETFs", f"{live_overview['etf_ticker'].nunique()}")
+        with m2:
+            st.metric("High Deviation", f"{int((live_overview['risk_bucket'] == 'High').sum())}")
+        with m3:
+            st.metric("Anomaly Flags", f"{int(live_overview['anomaly_flag'].sum())}")
+        with m4:
+            st.metric("Actionable Signals", f"{int((live_overview['action'] != 'HOLD').sum())}")
 
-        anomaly_chart = go.Figure()
-        anomaly_chart.add_trace(
-            go.Scatter(
-                x=anomaly_plot_data["timestamp"],
-                y=anomaly_plot_data["residual"],
-                mode="lines",
-                name="Residual",
-                line={"color": "#2f4b7c", "width": 2},
-            )
-        )
+        c1, c2 = st.columns([1.0, 1.4])
+        with c1:
+            st.plotly_chart(build_deviation_heatmap(live_overview), use_container_width=True)
 
-        flagged = anomaly_plot_data[anomaly_plot_data["anomaly_detected"] == True]
-        if not flagged.empty:
-            anomaly_chart.add_trace(
-                go.Scatter(
-                    x=flagged["timestamp"],
-                    y=flagged["residual"],
-                    mode="markers",
-                    name="Detected Anomaly",
-                    marker={"color": "#d62728", "size": 9, "symbol": "diamond"},
-                    customdata=np.stack(
-                        [
-                            flagged["anomaly_type"].fillna("unknown").astype(str).to_numpy(),
-                            flagged["confidence"].fillna(0.0).astype(float).to_numpy(),
-                        ],
-                        axis=-1,
-                    ),
-                    hovertemplate=(
-                        "Timestamp: %{x}<br>"
-                        "Residual: %{y:.6f}<br>"
-                        "Type: %{customdata[0]}<br>"
-                        "Confidence: %{customdata[1]:.2f}<extra></extra>"
-                    ),
-                )
-            )
-
-        anomaly_chart.update_layout(
-            title=f"{selected_pair}: Residual Structure and Detected Anomalies",
-            xaxis_title="Timestamp",
-            yaxis_title="Residual (Actual - Predicted Tracking Error)",
-            template="plotly_white",
-            height=420,
-        )
-        st.plotly_chart(anomaly_chart, use_container_width=True)
-
-        status_col, type_col, confidence_col, score_col = st.columns(4)
-        with status_col:
-            st.metric("Latest Anomaly", "Yes" if latest_anomaly["anomaly_detected"] else "No")
-        with type_col:
-            st.metric("Anomaly Type", str(latest_anomaly["anomaly_type"]))
-        with confidence_col:
-            st.metric("Confidence", f"{float(latest_anomaly['confidence']):.2f}")
-        with score_col:
-            st.metric("Ensemble Score", f"{float(latest_anomaly['score']):.4f}")
-
-        st.caption(str(latest_anomaly["explanation"]))
-        st.caption(f"Recommended action: {latest_anomaly['recommended_action']}")
-
-        recent_anomalies = anomaly_scored[anomaly_scored["anomaly_detected"] == True].copy()
-        if recent_anomalies.empty:
-            st.info("No structural anomalies were detected for the selected pair in the current window.")
-        else:
-            show_cols = [
-                "residual",
-                "autoencoder_error",
-                "isolation_score",
-                "mean_shift",
-                "volatility_ratio",
-                "autocorr_shift",
-                "anomaly_type",
+        with c2:
+            st.markdown("**Live ETF Universe — use the selector above the tabs to switch pair**")
+            display_cols = [
+                "etf_ticker",
+                "benchmark_ticker",
+                "predicted_error_pct",
+                "actual_error_pct",
+                "risk_bucket",
+                "anomaly_flag",
+                "action",
                 "confidence",
-                "explanation",
+                "recommended_shares",
+                "estimated_profit",
+                "pair",
             ]
-            st.markdown("**Recent Detected Anomalies**")
+            # Static color-coded table — selection is handled by the radio above the
+            # tabs, so no version-sensitive on_select API is needed here.
             st.dataframe(
-                recent_anomalies[show_cols]
-                .tail(12)
-                .sort_index(ascending=False),
+                style_live_table(live_overview[display_cols].copy()),
+                hide_index=True,
                 use_container_width=True,
             )
 
-    st.subheader("SHAP Explainability + Counterfactuals")
-    pair_features = rt_feature_panel[rt_feature_panel["pair"] == selected_pair].dropna()
-    if pair_features.empty:
-        st.info("Not enough clean feature rows for explainability output.")
-    else:
-        input_columns = model.numeric_columns + model.categorical_columns
-        latest_observation = pair_features.tail(1)[input_columns]
+        st.markdown("**Most Deviant ETFs (Top 10)**")
+        top10 = live_overview.head(10).copy()
+        top10_display = top10[
+            [
+                "etf_ticker",
+                "benchmark_ticker",
+                "predicted_error_pct",
+                "actual_error_pct",
+                "risk_bucket",
+                "anomaly_flag",
+                "action",
+                "pair",
+            ]
+        ].rename(columns={"action": "arbitrage_signal"})
+        st.dataframe(style_live_table(top10_display), use_container_width=True)
 
-        explainer = TrackingErrorExplainer(model)
-        shap_df = explainer.explain_observation(latest_observation)
-        waterfall = _build_shap_waterfall_figure(shap_df, top_features=10)
-        st.plotly_chart(waterfall, use_container_width=True)
+    with top_tabs[1]:
+        st.subheader(f"Detailed View - {selected_pair}")
 
-        counterfactuals = explainer.generate_counterfactuals(
-            observation=latest_observation,
-            num_counterfactuals=3,
-            max_features_to_change=3,
+        residual_panel = _build_residual_panel(
+            prediction_series=prediction_series,
+            feature_panel=rt_feature_panel,
+            pair_name=selected_pair,
         )
-        for counterfactual in counterfactuals:
-            st.markdown(f"**{counterfactual.scenario_name}**")
-            st.write(
-                {
-                    "original_prediction": counterfactual.original_prediction,
-                    "counterfactual_prediction": counterfactual.counterfactual_prediction,
-                    "improvement_bps": counterfactual.improvement_bps,
-                    "changed_features": counterfactual.changed_features,
-                    "narrative": counterfactual.narrative,
+
+        # Build a separate daily panel for the 30-day history context.
+        try:
+            daily_market_panel = load_market_panel(period="60d", interval="1d")
+            daily_feature_panel = build_feature_panel(
+                data=daily_market_panel,
+                horizon=int(horizon),
+                rolling_window=int(rolling_window),
+            )
+        except Exception:
+            daily_feature_panel = pd.DataFrame(columns=rt_feature_panel.columns)
+
+        st.plotly_chart(
+            build_history_chart(
+                pair_name=selected_pair,
+                intraday_residual_panel=residual_panel,
+                daily_feature_panel=daily_feature_panel,
+            ),
+            use_container_width=True,
+        )
+
+        lower_left, lower_right = st.columns([1.1, 1.0])
+
+        with lower_left:
+            st.markdown("**SHAP Explanation (Latest Prediction)**")
+            pair_features = rt_feature_panel[rt_feature_panel["pair"] == selected_pair].dropna()
+            if pair_features.empty:
+                st.info("Not enough clean feature rows for SHAP explainability.")
+            else:
+                input_columns = model.numeric_columns + model.categorical_columns
+                latest_observation = pair_features.tail(1)[input_columns]
+
+                explainer = TrackingErrorExplainer(model)
+                shap_df = explainer.explain_observation(latest_observation)
+                st.plotly_chart(_build_shap_waterfall_figure(shap_df, top_features=10), use_container_width=True)
+
+                with st.expander("Counterfactual What-If Scenarios", expanded=False):
+                    counterfactuals = explainer.generate_counterfactuals(
+                        observation=latest_observation,
+                        num_counterfactuals=3,
+                        max_features_to_change=3,
+                    )
+                    for cf in counterfactuals:
+                        st.write(
+                            {
+                                "scenario": cf.scenario_name,
+                                "original_prediction": cf.original_prediction,
+                                "counterfactual_prediction": cf.counterfactual_prediction,
+                                "improvement_bps": cf.improvement_bps,
+                                "changed_features": cf.changed_features,
+                                "narrative": cf.narrative,
+                            }
+                        )
+
+        with lower_right:
+            st.markdown("**Anomaly Detection (Previous Module Output)**")
+            latest_anomaly = anomaly_latest_map.get(selected_pair, {})
+
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                st.metric("Anomaly", "Yes" if bool(latest_anomaly.get("anomaly_detected", False)) else "No")
+            with a2:
+                st.metric("Type", str(latest_anomaly.get("anomaly_type", "none")))
+            with a3:
+                st.metric("Confidence", f"{float(latest_anomaly.get('confidence', 0.0)):.2f}")
+
+            st.caption(str(latest_anomaly.get("explanation", "No anomaly diagnostics available.")))
+            st.caption(f"Recommended action: {latest_anomaly.get('recommended_action', 'Monitor')}")
+
+            pair_anomaly_history = anomaly_history_map.get(selected_pair, pd.DataFrame())
+            if not pair_anomaly_history.empty:
+                recent_anomalies = pair_anomaly_history[pair_anomaly_history["anomaly_detected"] == True].copy()  # noqa: E712
+                if recent_anomalies.empty:
+                    st.info("No structural anomalies detected for this pair in the current history window.")
+                else:
+                    st.dataframe(
+                        recent_anomalies[
+                            [
+                                "residual",
+                                "anomaly_type",
+                                "confidence",
+                                "score",
+                                "recommended_action",
+                            ]
+                        ].tail(10),
+                        use_container_width=True,
+                    )
+            else:
+                st.info("Insufficient residual history for robust anomaly diagnostics.")
+
+    with top_tabs[2]:
+        st.subheader("Arbitrage Signal Panel")
+
+        if universe_signals.empty:
+            st.info("No actionable arbitrage signals generated at the current timestamp.")
+        else:
+            signal_display = universe_signals[
+                [
+                    "timestamp",
+                    "pair",
+                    "action",
+                    "confidence",
+                    "recommended_shares",
+                    "notional",
+                    "estimated_profit",
+                    "estimated_profit_bps",
+                    "reason",
+                ]
+            ].copy()
+
+            signal_display = signal_display.rename(
+                columns={
+                    "action": "arbitrage_signal",
+                    "confidence": "signal_confidence",
+                    "notional": "recommended_size_usd",
                 }
             )
+            st.dataframe(
+                signal_display.style.format(
+                    {
+                        "signal_confidence": "{:.2f}",
+                        "recommended_size_usd": "${:,.0f}",
+                        "estimated_profit": "${:,.0f}",
+                        "estimated_profit_bps": "{:.1f}",
+                    }
+                ),
+                use_container_width=True,
+            )
 
-    st.subheader("Arbitrage Signal Panel")
-    signal_generator = ArbitrageSignalGenerator(
-        confidence_threshold=0.70,
-        entry_tracking_error=0.0005,
-        max_notional=1_500_000.0,
-        min_notional=100_000.0,
-        transaction_cost_bps=3.0,
-        slippage_bps=2.0,
-        persistence_window=max(6, ARBITRAGE_WINDOW // 10),
-        liquidity_window=12,
-    )
+            pair_signal = universe_signals[universe_signals["pair"] == selected_pair]
+            if not pair_signal.empty:
+                signal = pair_signal.iloc[0]
+                st.markdown(f"**Desk Recommendation - {selected_pair}**")
+                s1, s2, s3, s4 = st.columns(4)
+                with s1:
+                    st.metric("Signal", str(signal["action"]))
+                with s2:
+                    st.metric("Confidence", f"{float(signal['confidence']):.2f}")
+                with s3:
+                    st.metric("Recommended Size", f"${float(signal['notional']):,.0f}")
+                with s4:
+                    st.metric("Estimated Profit", f"${float(signal['estimated_profit']):,.0f}")
+                st.caption(str(signal["reason"]))
 
-    universe_signals = signal_generator.generate_universe_signals(
-        intraday_panel=market_panel,
-        prediction_snapshot=latest_predictions,
-    )
+    with top_tabs[3]:
+        st.subheader("Alerting System")
 
-    if universe_signals.empty:
-        st.info("No actionable arbitrage signals at the latest timestamp.")
-    else:
-        display_columns = [
-            "pair",
-            "action",
-            "confidence",
-            "recommended_shares",
-            "notional",
-            "estimated_profit",
-            "reason",
-        ]
-        st.dataframe(universe_signals[display_columns], use_container_width=True)
+        st.markdown("**Per-ETF Alert Enablement**")
+        pair_toggle_columns = st.columns(len(PAIR_CONFIGS))
+        for idx, etf in enumerate(PAIR_CONFIGS.keys()):
+            with pair_toggle_columns[idx]:
+                st.session_state.pair_alert_enabled[etf] = st.checkbox(
+                    etf,
+                    value=st.session_state.pair_alert_enabled.get(etf, True),
+                    key=f"alert_toggle_{etf}",
+                )
 
-        pair_signal = universe_signals[universe_signals["pair"] == selected_pair]
-        if not pair_signal.empty:
-            st.markdown("**Selected Pair Trade Recommendation**")
-            signal = pair_signal.iloc[0]
+        alert_config = {
+            "enabled": bool(auto_alerts_enabled),
+            "threshold_pct": float(threshold_pct),
+            "persistence_minutes": int(persistence_minutes),
+            "email_enabled": bool(email_enabled),
+            "slack_enabled": bool(slack_enabled),
+            "smtp_host": smtp_host,
+            "smtp_port": int(smtp_port),
+            "username": smtp_user,
+            "password": smtp_password,
+            "from_email": from_email,
+            "to_email": to_email,
+            "slack_webhook_url": slack_webhook_url,
+        }
 
-            metric_left, metric_mid, metric_right, metric_far = st.columns(4)
-            with metric_left:
-                st.metric("Action", str(signal["action"]))
-            with metric_mid:
-                st.metric("Confidence", f"{float(signal['confidence']):.2f}")
-            with metric_right:
-                st.metric("Recommended Shares", f"{int(signal['recommended_shares']):,}")
-            with metric_far:
-                st.metric("Notional", f"${float(signal['notional']):,.0f}")
+        # Dispatch alerts only when the engine is enabled.
+        if alert_config["enabled"]:
+            now_ts = pd.Timestamp.utcnow().tz_localize(None)
+            process_threshold_alerts(
+                live_table=live_overview,
+                alert_config=alert_config,
+                now_ts=now_ts,
+            )
 
-            profit_col, score_col = st.columns(2)
-            with profit_col:
-                st.metric("Estimated Net Profit", f"${float(signal['estimated_profit']):,.0f}")
-            with score_col:
-                st.metric("Expected Profit (bps)", f"{float(signal['estimated_profit_bps']):.1f}")
+        st.markdown("**Alert Trigger Rule**")
+        st.write(
+            {
+                "threshold": f"|tracking error| >= {threshold_pct:.2f}%",
+                "persistence": f">= {int(persistence_minutes)} minutes",
+                "engine_enabled": bool(auto_alerts_enabled),
+                "email_enabled": bool(email_enabled),
+                "slack_enabled": bool(slack_enabled),
+            }
+        )
 
-            st.caption(str(signal["reason"]))
+        st.markdown("**Sent Alert Log**")
+        if st.session_state.alert_log:
+            alert_log_df = pd.DataFrame(st.session_state.alert_log).sort_values("timestamp", ascending=False)
+            st.dataframe(alert_log_df, use_container_width=True)
+        else:
+            st.info("No alerts sent in this session.")
+
+    with top_tabs[4]:
+        st.subheader("Historical & Analytics")
+
+        analytics_top = st.columns(2)
+        with analytics_top[0]:
+            # Trend chart: mean predicted TE over time for market-level drift monitoring.
+            if not prediction_series.empty:
+                global_trend = (
+                    prediction_series.groupby("timestamp", observed=True)["predicted_tracking_error"]
+                    .mean()
+                    .reset_index()
+                )
+                trend_fig = go.Figure(
+                    go.Scatter(
+                        x=global_trend["timestamp"],
+                        y=global_trend["predicted_tracking_error"] * 100.0,
+                        mode="lines",
+                        line={"color": "#103a6f", "width": 2},
+                        name="Mean Predicted TE",
+                    )
+                )
+                trend_fig.update_layout(
+                    title="Global Tracking Error Trend",
+                    xaxis_title="Timestamp",
+                    yaxis_title="Predicted TE (%)",
+                    template="plotly_white",
+                    height=350,
+                    margin={"l": 20, "r": 20, "t": 45, "b": 10},
+                )
+                st.plotly_chart(trend_fig, use_container_width=True)
+            else:
+                st.info("Insufficient prediction history to plot global trend.")
+
+        with analytics_top[1]:
+            # Distribution chart: shape of absolute TE to monitor tail risk concentration.
+            if not prediction_series.empty:
+                distribution_fig = go.Figure(
+                    go.Histogram(
+                        x=(prediction_series["predicted_tracking_error"].abs() * 100.0),
+                        nbinsx=30,
+                        marker={"color": "#d97a1f"},
+                        name="|Predicted TE|",
+                    )
+                )
+                distribution_fig.update_layout(
+                    title="Distribution of Absolute Predicted Errors",
+                    xaxis_title="Absolute Predicted TE (%)",
+                    yaxis_title="Frequency",
+                    template="plotly_white",
+                    height=350,
+                    margin={"l": 20, "r": 20, "t": 45, "b": 10},
+                )
+                st.plotly_chart(distribution_fig, use_container_width=True)
+            else:
+                st.info("Insufficient prediction history to plot distribution.")
+
+        st.markdown("**Backtesting Summary**")
+        backtest_metrics = evaluate_backtest_metrics(feature_panel=feature_panel, model=model)
+        if backtest_metrics:
+            b1, b2, b3, b4, b5 = st.columns(5)
+            with b1:
+                st.metric("MAE", f"{backtest_metrics['mae']:.6f}")
+            with b2:
+                st.metric("RMSE", f"{backtest_metrics['rmse']:.6f}")
+            with b3:
+                st.metric("MAPE", f"{backtest_metrics['mape']:.4f}")
+            with b4:
+                st.metric("R2", f"{backtest_metrics['r2']:.4f}")
+            with b5:
+                st.metric("Scored Rows", f"{int(backtest_metrics['scored_rows'])}")
+        else:
+            st.info("Backtest metrics are unavailable for the current sample size.")
 
 
 if __name__ == "__main__":
