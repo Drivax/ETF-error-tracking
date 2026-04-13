@@ -53,6 +53,9 @@ Data is retrieved from Yahoo Finance through `yfinance`, using real listed instr
 - `QQQ` vs `^NDX` (Nasdaq-100 index)
 - `FEZ` vs `^STOXX50E` (Euro Stoxx 50)
 - `URTH` vs `ACWI` (MSCI World proxy)
+- `BNK.PA` vs `^FCHI` (French-listed Europe banks UCITS ETF vs CAC 40)
+- `BNKE.L` vs `^STOXX50E` (STOXX Europe 600 Banks UCITS ETF vs Euro Stoxx 50)
+- `EUFN` vs `^STOXX` (MSCI Europe Financials proxy ETF vs STOXX benchmark)
 
 Daily and intraday bars are supported.
 

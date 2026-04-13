@@ -13,6 +13,12 @@ PAIR_CONFIGS = {
     "QQQ": "^NDX",
     "FEZ": "^STOXX50E",
     "URTH": "ACWI",
+    # French-listed Europe banks UCITS ETF vs CAC 40.
+    "BNK.PA": "^FCHI",
+    # STOXX Europe 600 Banks UCITS ETF vs Euro STOXX 50.
+    "BNKE.L": "^STOXX50E",
+    # MSCI Europe Financials proxy ETF vs STOXX Europe broad benchmark.
+    "EUFN": "^STOXX",
 }
 
 # Sector mapping for portfolio-level exposure rollups.
@@ -21,6 +27,9 @@ ETF_SECTOR_MAP = {
     "QQQ": "US Technology Growth",
     "FEZ": "Europe Large Cap",
     "URTH": "Global Equity",
+    "BNK.PA": "Europe Banks",
+    "BNKE.L": "Europe Banks",
+    "EUFN": "Europe Financials",
 }
 
 # Data retrieval defaults

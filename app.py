@@ -1086,7 +1086,7 @@ def main() -> None:
         )
 
         st.markdown("**Portfolio Weights**")
-        st.caption("Format: SPY:0.30, QQQ:0.25, FEZ:0.20, URTH:0.25")
+        st.caption("Format: ETF:weight, ETF:weight (for example: SPY:0.25, BNK.PA:0.20)")
         default_weight_text = _default_portfolio_weight_text(sorted(PAIR_CONFIGS.keys()))
         portfolio_weights_text = st.text_area(
             "ETF Weights",
@@ -1207,7 +1207,7 @@ def main() -> None:
 
     portfolio_weight_map, portfolio_weight_errors = parse_portfolio_weights(
         raw_weights=portfolio_weights_text,
-        universe_etfs=sorted(live_overview["etf_ticker"].dropna().unique().tolist()),
+        universe_etfs=sorted(PAIR_CONFIGS.keys()),
     )
     portfolio_aggregator = PortfolioRiskAggregator(
         var_confidence=float(portfolio_var_conf),
