@@ -50,6 +50,7 @@ From a regulatory perspective, the pipeline supports model risk management princ
 ### Data Sources
 Data is retrieved from Yahoo Finance through `yfinance`, using real listed instruments and benchmark proxies:
 - `SPY` vs `^GSPC` (S&P 500 index)
+- `ESE.PA` vs `^GSPC` (Euronext-listed S&P 500 UCITS ETF)
 - `QQQ` vs `^NDX` (Nasdaq-100 index)
 - `FEZ` vs `^STOXX50E` (Euro Stoxx 50)
 - `URTH` vs `ACWI` (MSCI World proxy)

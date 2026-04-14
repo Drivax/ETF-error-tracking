@@ -10,6 +10,8 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 # ETF-benchmark mapping for live and historical analysis
 PAIR_CONFIGS = {
     "SPY": "^GSPC",
+    # Euronext-listed S&P 500 UCITS ETF vs S&P 500 benchmark.
+    "ESE.PA": "^GSPC",
     "QQQ": "^NDX",
     "FEZ": "^STOXX50E",
     "URTH": "ACWI",
@@ -24,6 +26,7 @@ PAIR_CONFIGS = {
 # Sector mapping for portfolio-level exposure rollups.
 ETF_SECTOR_MAP = {
     "SPY": "US Broad Equity",
+    "ESE.PA": "US Broad Equity",
     "QQQ": "US Technology Growth",
     "FEZ": "Europe Large Cap",
     "URTH": "Global Equity",
