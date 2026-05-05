@@ -20,6 +20,8 @@ The platform is designed for bank risk management and trading workflows. It incl
 - Feature engineering for daily and intraday tracking behavior.
 - A predictive model for forward tracking error.
 - A signal engine for abnormal ETF-index dislocations.
+- Residual anomaly detection using an ensemble of MLP autoencoder, Isolation Forest, and statistical shift tests.
+- Market regime classification (Calm / Stress / High_Vol) via HMM/GMM with regime-adaptive thresholds.
 - Portfolio-level risk aggregation (total TE risk, TE VaR, sector exposure, ETF risk contribution).
 - Explainability outputs with SHAP and counterfactual analysis.
 - A Streamlit dashboard for analysts and risk managers.
@@ -215,6 +217,33 @@ This approximates time needed for half of a shock to decay.
 
 Interpretation: smaller half-life means quicker return to normal conditions.
 
+### Residual Anomaly Detection
+Anomaly detection is implemented in `src/anomaly_detector.py` and operates on the residual series $\varepsilon_t = \text{TE}_t - \hat{\text{TE}}_t$. The ensemble combines:
+- **MLP autoencoder**: learns normal residual geometry; high reconstruction error flags unusual patterns.
+- **Isolation Forest**: non-parametric outlier detector that is fast and calibration-free.
+- **Statistical shift tests**: rolling mean drift, volatility ratio, and autocorrelation shift.
+
+An anomaly is raised when at least one model signal and one statistical signal exceed their calibrated thresholds, or when three or more signals fire simultaneously. Each result includes an anomaly type (`magnitude`, `structural`, `regime_change`, or `none`), a confidence score, and a plain-language explanation.
+
+### Market Regime Detection
+Regime classification is implemented in `src/regime_detector.py`. A Hidden Markov Model (with Gaussian Mixture Model fallback) is fitted on rolling residual features: mean, volatility, autocorrelation, skewness, and kurtosis. States are mapped to domain labels by volatility ranking:
+
+| Regime | Residual Volatility | Arbitrage Confidence Floor |
+|---|---|---|
+| **Calm** | Low | Relaxed (×0.96 of base) |
+| **Stress** | Elevated | Tightened (×1.08 of base) |
+| **High_Vol** | Extreme | Strictest (×1.16 of base) |
+
+Regime-adaptive thresholds automatically raise alert levels and tighten execution standards during stress and high-volatility periods.
+
+### Portfolio Risk Aggregation
+Portfolio-level metrics are implemented in `src/portfolio_risk.py`:
+- Weighted portfolio TE time series from per-pair predictions.
+- Historical TE VaR at a configurable confidence level (default 95%).
+- ETF risk contribution table (weighted absolute TE per ETF).
+- Sector exposure rollup using the `ETF_SECTOR_MAP` in `config.py`.
+- Aggregate arbitrage risk score and actionable portfolio weight share.
+
 ## Evaluation Metrics & Results
 Model quality is evaluated with:
 - MAE for absolute error magnitude.
@@ -292,16 +321,20 @@ ETF-error-tracking/
 │  ├─ 01_data_collection.ipynb
 │  ├─ 02_feature_engineering.ipynb
 │  ├─ 03_model_training.ipynb
-│  └─ 04_results_and_evaluation.ipynb
+│  ├─ 04_results_and_evaluation.ipynb
+│  └─ 05_anomaly_regime_portfolio.ipynb
 └─ src/
 	├─ __init__.py
+	├─ anomaly_detector.py
 	├─ arbitrage_detector.py
 	├─ arbitrage_signal.py
 	├─ data_loader.py
 	├─ explainability.py
 	├─ features.py
 	├─ models.py
+	├─ portfolio_risk.py
 	├─ real_time_predictor.py
+	├─ regime_detector.py
 	└─ utils.py
 ```
 
@@ -352,3 +385,4 @@ Open notebooks in order:
 2. `notebooks/02_feature_engineering.ipynb`
 3. `notebooks/03_model_training.ipynb`
 4. `notebooks/04_results_and_evaluation.ipynb`
+5. `notebooks/05_anomaly_regime_portfolio.ipynb`
