@@ -9,6 +9,7 @@ import pandas as pd
 
 from config import (
     ARBITRAGE_WINDOW,
+    ARTIFACTS_DIR,
     DEFAULT_HORIZON,
     DEFAULT_INTERVAL,
     DEFAULT_INTRADAY_INTERVAL,
@@ -24,6 +25,8 @@ from src.explainability import TrackingErrorExplainer
 from src.features import FeatureEngineer
 from src.models import TrackingErrorModel
 from src.real_time_predictor import RealTimeTrackingErrorPredictor
+from src.utils import save_json
+from src.walk_forward import WalkForwardPaperTrader
 
 
 def build_market_and_features(
@@ -182,6 +185,66 @@ def run_realtime_mode(args: argparse.Namespace) -> None:
         print(f"  narrative: {scenario.narrative}")
 
 
+def run_walk_forward_mode(args: argparse.Namespace) -> None:
+    """Run walk-forward backtest plus paper-trading simulation on unseen periods."""
+    market_panel, feature_panel = build_market_and_features(
+        period=args.lookback_period,
+        interval=args.interval,
+        horizon=args.horizon,
+        rolling_window=args.window,
+    )
+
+    runner = WalkForwardPaperTrader(
+        model_random_state=args.random_state,
+        confidence_threshold=args.wf_confidence_threshold,
+        entry_tracking_error=args.wf_entry_tracking_error,
+        max_notional=args.risk_budget_notional,
+        min_notional=args.min_notional,
+        transaction_cost_bps=args.execution_cost_bps,
+        slippage_bps=args.slippage_bps,
+        min_train_rows=args.wf_min_train_rows,
+        retrain_every=args.wf_retrain_every,
+        execution_delay_bars=args.execution_delay_bars,
+        holding_bars=args.holding_bars,
+        drift_window=args.drift_window,
+        retrain_mae_ratio_trigger=args.retrain_mae_ratio_trigger,
+        retrain_mean_shift_trigger_sigma=args.retrain_mean_shift_trigger_sigma,
+    )
+
+    result = runner.run(market_panel=market_panel, feature_panel=feature_panel, target_col="target_te")
+
+    print("Walk-Forward KPIs")
+    for metric, value in result["kpis"].items():
+        if isinstance(value, float):
+            print(f"{metric}: {value:.6f}")
+        else:
+            print(f"{metric}: {value}")
+
+    print("\nThreshold Recalibration")
+    for key, value in result["recalibration"].items():
+        if isinstance(value, float):
+            print(f"{key}: {value:.6f}")
+        else:
+            print(f"{key}: {value}")
+
+    output_prefix = ARTIFACTS_DIR / f"walk_forward_{args.interval}_{args.lookback_period}"
+    predictions_path = Path(f"{output_prefix}_predictions.csv")
+    paper_path = Path(f"{output_prefix}_paper_trades.csv")
+    alerts_path = Path(f"{output_prefix}_alerts.csv")
+    recalibration_path = Path(f"{output_prefix}_recalibration.json")
+
+    result["predictions"].to_csv(predictions_path, index=False)
+    result["paper_trades"].to_csv(paper_path, index=False)
+    result["alerts"].to_csv(alerts_path, index=False)
+    save_json(recalibration_path, result["recalibration"])
+
+    print("\nArtifacts")
+    print(f"Predictions: {predictions_path}")
+    print(f"Paper trades: {paper_path}")
+    print(f"Alerts: {alerts_path}")
+    print(f"Recalibration: {recalibration_path}")
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="ETF tracking error analytics CLI")
@@ -189,6 +252,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train", action="store_true", help="Train model and save artifact.")
     parser.add_argument("--predict", action="store_true", help="Run standard latest-row predictions.")
     parser.add_argument("--real-time", action="store_true", help="Run intraday real-time desk workflow.")
+    parser.add_argument("--walk-forward", action="store_true", help="Run walk-forward paper-trading simulation.")
 
     parser.add_argument("--model-path", type=str, default=str(MODEL_ARTIFACT_PATH), help="Model artifact path.")
     parser.add_argument("--lookback-period", type=str, default=DEFAULT_PERIOD, help="Historical lookback for train/predict.")
@@ -211,9 +275,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--risk-budget-notional", type=float, default=1_000_000.0, help="Risk budget for action sizing.")
     parser.add_argument("--explain-pair", type=str, default=None, help="Specific pair for SHAP and counterfactual output.")
 
+    parser.add_argument(
+        "--wf-confidence-threshold",
+        type=float,
+        default=0.70,
+        help="Initial confidence threshold for walk-forward execution.",
+    )
+    parser.add_argument(
+        "--wf-entry-tracking-error",
+        type=float,
+        default=0.0005,
+        help="Entry tracking error threshold used during walk-forward.",
+    )
+    parser.add_argument("--wf-min-train-rows", type=int, default=400, help="Minimum rows before first walk-forward retrain.")
+    parser.add_argument("--wf-retrain-every", type=int, default=20, help="Retrain cadence in walk-forward bars.")
+    parser.add_argument("--execution-delay-bars", type=int, default=1, help="Execution delay in bars before entry fill.")
+    parser.add_argument("--min-notional", type=float, default=100_000.0, help="Minimum notional for actionable execution.")
+    parser.add_argument("--drift-window", type=int, default=80, help="Window size for residual drift monitoring.")
+    parser.add_argument(
+        "--retrain-mae-ratio-trigger",
+        type=float,
+        default=1.45,
+        help="Retrain trigger when recent residual MAE ratio exceeds this threshold.",
+    )
+    parser.add_argument(
+        "--retrain-mean-shift-trigger-sigma",
+        type=float,
+        default=2.5,
+        help="Retrain trigger when residual mean shift exceeds this sigma threshold.",
+    )
+
     args = parser.parse_args()
-    if not any([args.train, args.predict, args.real_time]):
-        parser.error("At least one action is required: --train and/or --predict and/or --real-time")
+    if not any([args.train, args.predict, args.real_time, args.walk_forward]):
+        parser.error(
+            "At least one action is required: --train and/or --predict and/or --real-time and/or --walk-forward"
+        )
     return args
 
 
@@ -227,6 +323,8 @@ def main() -> None:
         run_batch_inference(args)
     if args.real_time:
         run_realtime_mode(args)
+    if args.walk_forward:
+        run_walk_forward_mode(args)
 
 
 if __name__ == "__main__":

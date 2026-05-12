@@ -379,7 +379,33 @@ python -m streamlit run app.py
 python predict.py --real-time --intraday-period 60d --intraday-interval 5m
 ```
 
-### 7) Run notebooks
+### 7) Run walk-forward backtest + paper-trading simulation
+```bash
+python predict.py --walk-forward --lookback-period 2y --interval 1d --wf-min-train-rows 400 --wf-retrain-every 20 --execution-delay-bars 1 --holding-bars 6
+```
+
+This walk-forward mode trains on expanding history and evaluates on unseen timestamps only. It tracks:
+- Trading precision (profitable actionable signals share)
+- Hit ratio after execution delay
+- Realized spread capture
+- Max drawdown from cumulative simulated PnL
+- Standard ML error metrics (MAE, RMSE)
+
+It also recalibrates execution thresholds using forward results:
+- Recommended confidence threshold
+- Recommended minimum expected profit threshold (bps)
+
+And it produces monitoring alerts to trigger retraining when:
+- Residual model drift breaches MAE-ratio or mean-shift limits
+- Residual regime shifts into Stress/High_Vol with high confidence
+
+Generated artifacts are saved under `artifacts/`:
+- `walk_forward_<interval>_<period>_predictions.csv`
+- `walk_forward_<interval>_<period>_paper_trades.csv`
+- `walk_forward_<interval>_<period>_alerts.csv`
+- `walk_forward_<interval>_<period>_recalibration.json`
+
+### 8) Run notebooks
 Open notebooks in order:
 1. `notebooks/01_data_collection.ipynb`
 2. `notebooks/02_feature_engineering.ipynb`
