@@ -405,7 +405,21 @@ Generated artifacts are saved under `artifacts/`:
 - `walk_forward_<interval>_<period>_alerts.csv`
 - `walk_forward_<interval>_<period>_recalibration.json`
 
-### 8) Run notebooks
+Comprehensive reports are automatically generated:
+- `backtest_per_pair_metrics_<prefix>.png` (4-chart dashboard)
+- `spread_capture_distribution_<prefix>.png` (boxplot by pair)
+- `drawdown_timeseries_<prefix>.png` (equity drawdown plots)
+- `backtest_summary_<prefix>.md` (summary table)
+
+### 8) Generate report from existing walk-forward results
+```bash
+python predict.py --report \
+  --predictions-path artifacts/walk_forward_1d_2y_predictions.csv \
+  --paper-trades-path artifacts/walk_forward_1d_2y_paper_trades.csv \
+  --report-prefix daily_comparison
+```
+
+### 9) Run notebooks
 Open notebooks in order:
 1. `notebooks/01_data_collection.ipynb`
 2. `notebooks/02_feature_engineering.ipynb`

@@ -27,6 +27,7 @@ from src.models import TrackingErrorModel
 from src.real_time_predictor import RealTimeTrackingErrorPredictor
 from src.utils import save_json
 from src.walk_forward import WalkForwardPaperTrader
+from src.report_generator import BacktestReportGenerator
 
 
 def build_market_and_features(
@@ -238,11 +239,42 @@ def run_walk_forward_mode(args: argparse.Namespace) -> None:
     result["alerts"].to_csv(alerts_path, index=False)
     save_json(recalibration_path, result["recalibration"])
 
+    print("\nGenerating report...")
+    generator = BacktestReportGenerator(output_dir=ARTIFACTS_DIR)
+    generator.generate_full_report(
+        predictions_csv=predictions_path,
+        paper_trades_csv=paper_path,
+        alerts_csv=alerts_path,
+        kpis_overall=result["kpis"],
+        report_prefix=f"walk_forward_{args.interval}_{args.lookback_period}",
+    )
+
     print("\nArtifacts")
     print(f"Predictions: {predictions_path}")
     print(f"Paper trades: {paper_path}")
     print(f"Alerts: {alerts_path}")
     print(f"Recalibration: {recalibration_path}")
+
+
+def run_report_mode(args: argparse.Namespace) -> None:
+    """Generate comprehensive backtest report from existing walk-forward results."""
+    generator = BacktestReportGenerator(output_dir=ARTIFACTS_DIR)
+
+    predictions_path = Path(args.predictions_path)
+    paper_trades_path = Path(args.paper_trades_path)
+    alerts_path = Path(args.alerts_path) if args.alerts_path else None
+
+    if not predictions_path.exists():
+        raise FileNotFoundError(f"Predictions file not found: {predictions_path}")
+    if not paper_trades_path.exists():
+        raise FileNotFoundError(f"Paper trades file not found: {paper_trades_path}")
+
+    generator.generate_full_report(
+        predictions_csv=predictions_path,
+        paper_trades_csv=paper_trades_path,
+        alerts_csv=alerts_path,
+        report_prefix=args.report_prefix,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -253,6 +285,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predict", action="store_true", help="Run standard latest-row predictions.")
     parser.add_argument("--real-time", action="store_true", help="Run intraday real-time desk workflow.")
     parser.add_argument("--walk-forward", action="store_true", help="Run walk-forward paper-trading simulation.")
+    parser.add_argument("--report", action="store_true", help="Generate backtest report from existing walk-forward results.")
 
     parser.add_argument("--model-path", type=str, default=str(MODEL_ARTIFACT_PATH), help="Model artifact path.")
     parser.add_argument("--lookback-period", type=str, default=DEFAULT_PERIOD, help="Historical lookback for train/predict.")
@@ -305,10 +338,33 @@ def parse_args() -> argparse.Namespace:
         help="Retrain trigger when residual mean shift exceeds this sigma threshold.",
     )
 
+    parser.add_argument(
+        "--predictions-path",
+        type=str,
+        help="Path to predictions CSV for report generation.",
+    )
+    parser.add_argument(
+        "--paper-trades-path",
+        type=str,
+        help="Path to paper trades CSV for report generation.",
+    )
+    parser.add_argument(
+        "--alerts-path",
+        type=str,
+        default=None,
+        help="Path to alerts CSV for report generation (optional).",
+    )
+    parser.add_argument(
+        "--report-prefix",
+        type=str,
+        default="backtest",
+        help="Prefix for generated report files.",
+    )
+
     args = parser.parse_args()
-    if not any([args.train, args.predict, args.real_time, args.walk_forward]):
+    if not any([args.train, args.predict, args.real_time, args.walk_forward, args.report]):
         parser.error(
-            "At least one action is required: --train and/or --predict and/or --real-time and/or --walk-forward"
+            "At least one action is required: --train and/or --predict and/or --real-time and/or --walk-forward and/or --report"
         )
     return args
 
@@ -325,6 +381,8 @@ def main() -> None:
         run_realtime_mode(args)
     if args.walk_forward:
         run_walk_forward_mode(args)
+    if args.report:
+        run_report_mode(args)
 
 
 if __name__ == "__main__":

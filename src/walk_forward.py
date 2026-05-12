@@ -339,7 +339,7 @@ class WalkForwardPaperTrader:
         residual_history_by_pair: dict[str, list[dict[str, Any]]] = {}
         regime_state_by_pair: dict[str, str | None] = {}
 
-        steps_since_retrain = self.retrain_every
+        steps_since_retrain = 0  # Start with 0 to delay first retrain until we have enough data
         force_retrain = False
 
         for idx in range(1, len(timestamps)):
@@ -352,7 +352,13 @@ class WalkForwardPaperTrader:
 
             if model is None or steps_since_retrain >= self.retrain_every or force_retrain:
                 model = TrackingErrorModel(random_state=self.model_random_state)
-                model.train(train_df, target_col=target_col, test_size=0.2)
+                # Use adaptive test_size based on training data size to ensure stable splits
+                # Keep more data for training on small datasets
+                if len(train_df) < 300:
+                    adaptive_test_size = 0.10  # Use 10% test split for smaller datasets
+                else:
+                    adaptive_test_size = 0.20  # Use standard 20% for larger datasets
+                model.train(train_df, target_col=target_col, test_size=adaptive_test_size)
                 steps_since_retrain = 0
                 force_retrain = False
 
