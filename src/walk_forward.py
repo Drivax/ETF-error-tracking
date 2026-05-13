@@ -50,6 +50,7 @@ class WalkForwardPaperTrader:
         drift_window: int = 80,
         retrain_mae_ratio_trigger: float = 1.45,
         retrain_mean_shift_trigger_sigma: float = 2.5,
+        monitor_every: int = 10,
     ) -> None:
         if min_train_rows < 120:
             raise ValueError("min_train_rows must be at least 120")
@@ -61,6 +62,8 @@ class WalkForwardPaperTrader:
             raise ValueError("holding_bars must be >= 1")
         if drift_window < 30:
             raise ValueError("drift_window must be >= 30")
+        if monitor_every < 1:
+            raise ValueError("monitor_every must be >= 1")
 
         self.model_random_state = model_random_state
         self.signal_generator = ArbitrageSignalGenerator(
@@ -79,6 +82,7 @@ class WalkForwardPaperTrader:
         self.drift_window = drift_window
         self.retrain_mae_ratio_trigger = retrain_mae_ratio_trigger
         self.retrain_mean_shift_trigger_sigma = retrain_mean_shift_trigger_sigma
+        self.monitor_every = monitor_every
 
     @staticmethod
     def _drop_invalid(feature_panel: pd.DataFrame, target_col: str) -> pd.DataFrame:
@@ -338,6 +342,7 @@ class WalkForwardPaperTrader:
 
         residual_history_by_pair: dict[str, list[dict[str, Any]]] = {}
         regime_state_by_pair: dict[str, str | None] = {}
+        cached_regime_result_by_pair: dict[str, dict[str, Any] | None] = {}
 
         steps_since_retrain = 0  # Start with 0 to delay first retrain until we have enough data
         force_retrain = False
@@ -387,14 +392,20 @@ class WalkForwardPaperTrader:
                 if pair_name not in residual_history_by_pair:
                     residual_history_by_pair[pair_name] = []
                     regime_state_by_pair[pair_name] = None
+                    cached_regime_result_by_pair[pair_name] = None
 
                 # Regime-adaptive thresholds are estimated from historical residuals only.
                 residual_frame = pd.DataFrame(residual_history_by_pair[pair_name])
                 adaptive_thresholds: dict[str, float] | None = None
-                regime_result: dict[str, Any] | None = None
-                if len(residual_frame) >= 60:
+                regime_result = cached_regime_result_by_pair[pair_name]
+                should_refresh_regime = len(residual_frame) >= 60 and (
+                    regime_result is None or len(residual_frame) % self.monitor_every == 0
+                )
+                if should_refresh_regime:
                     detector = RegimeDetector(rolling_window=24)
                     regime_result = detector.detect_regime(residual_frame["residual"])
+                    cached_regime_result_by_pair[pair_name] = regime_result
+                if regime_result is not None:
                     adaptive_thresholds = regime_result.get("adaptive_thresholds")
 
                 signal = self.signal_generator.generate_signal(
@@ -431,11 +442,15 @@ class WalkForwardPaperTrader:
                 )
 
                 pair_residual_frame = pd.DataFrame(residual_history_by_pair[pair_name])
-                pair_alerts, should_retrain, new_regime = self._drift_and_regime_alerts(
-                    pair_residual_frame,
-                    pair_name=pair_name,
-                    previous_regime=regime_state_by_pair[pair_name],
-                )
+                pair_alerts: list[dict[str, Any]] = []
+                should_retrain = False
+                new_regime = regime_state_by_pair[pair_name]
+                if len(pair_residual_frame) >= self.drift_window * 2 and len(pair_residual_frame) % self.monitor_every == 0:
+                    pair_alerts, should_retrain, new_regime = self._drift_and_regime_alerts(
+                        pair_residual_frame,
+                        pair_name=pair_name,
+                        previous_regime=regime_state_by_pair[pair_name],
+                    )
 
                 regime_state_by_pair[pair_name] = new_regime
                 if pair_alerts:

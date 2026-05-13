@@ -1,0 +1,40 @@
+{
+  "stage": "running_5m_15d",
+  "completed": [
+    {
+      "label": "1d_6mo",
+      "period": "6mo",
+      "interval": "1d",
+      "kpis": {
+        "ml_mae": 0.0010945838944274172,
+        "ml_rmse": 0.001767512793716334,
+        "trade_precision": 0.3935018050541516,
+        "hit_ratio_after_delay": 0.19494584837545126,
+        "realized_spread_capture": -3.691926438142636,
+        "max_drawdown": -233082.60791813,
+        "executed_trades": 277,
+        "total_realized_pnl": -146820.1899829738
+      },
+      "recalibration": {
+        "recommended_confidence_threshold": 0.7,
+        "recommended_min_expected_profit_bps": 30.0,
+        "objective_score": 0.25655,
+        "evaluated_trades": 229
+      },
+      "alert_count": 0,
+      "alert_rate": 0.0,
+      "robustness_score": 0.24153947653429605
+    }
+  ],
+  "current": {
+    "label": "5m_15d",
+    "period": "15d",
+    "interval": "5m",
+    "holding_bars": 12,
+    "min_train_rows": 180,
+    "retrain_every": 60,
+    "monitor_every": 100,
+    "market_rows": 6767,
+    "feature_rows": 6767
+  }
+}

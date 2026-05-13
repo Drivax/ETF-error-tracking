@@ -74,6 +74,7 @@ class ArbitrageSignalGenerator:
         self,
         confidence_threshold: float = 0.70,
         entry_tracking_error: float = 0.0005,
+        min_expected_profit_bps: float = 0.0,
         max_notional: float = 1_500_000.0,
         transaction_cost_bps: float = 3.0,
         slippage_bps: float = 2.0,
@@ -85,9 +86,12 @@ class ArbitrageSignalGenerator:
             raise ValueError("confidence_threshold must be between 0.50 and 0.99")
         if entry_tracking_error <= 0:
             raise ValueError("entry_tracking_error must be strictly positive")
+        if min_expected_profit_bps < 0:
+            raise ValueError("min_expected_profit_bps must be non-negative")
 
         self.confidence_threshold = confidence_threshold
         self.entry_tracking_error = entry_tracking_error
+        self.min_expected_profit_bps = min_expected_profit_bps
         self.max_notional = max_notional
         self.min_notional = min_notional
         self.transaction_cost_bps = transaction_cost_bps
@@ -288,7 +292,12 @@ class ArbitrageSignalGenerator:
             slippage_bps=self.slippage_bps,
         )
 
-        if confidence < active_confidence_threshold or recommended_notional <= 0 or estimated_profit <= 0:
+        if (
+            confidence < active_confidence_threshold
+            or recommended_notional <= 0
+            or estimated_profit <= 0
+            or estimated_profit_bps < self.min_expected_profit_bps
+        ):
             action = "HOLD"
             reason = (
                 "Signal below confidence or profit threshold; no capital allocation "

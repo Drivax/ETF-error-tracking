@@ -18,6 +18,9 @@ from config import (
     DEFAULT_WINDOW,
     MODEL_ARTIFACT_PATH,
     PAIR_CONFIGS,
+    REALTIME_CONFIDENCE_THRESHOLD,
+    REALTIME_ENTRY_TRACKING_ERROR,
+    REALTIME_MIN_EXPECTED_PROFIT_BPS,
 )
 from src.arbitrage_signal import ArbitrageSignalGenerator
 from src.data_loader import MarketDataLoader
@@ -130,8 +133,9 @@ def run_realtime_mode(args: argparse.Namespace) -> None:
     print(prediction_snapshot.to_string(index=False))
 
     signal_generator = ArbitrageSignalGenerator(
-        confidence_threshold=0.70,
-        entry_tracking_error=0.0005,
+        confidence_threshold=REALTIME_CONFIDENCE_THRESHOLD,
+        entry_tracking_error=REALTIME_ENTRY_TRACKING_ERROR,
+        min_expected_profit_bps=REALTIME_MIN_EXPECTED_PROFIT_BPS,
         max_notional=args.risk_budget_notional,
         min_notional=100_000.0,
         transaction_cost_bps=args.execution_cost_bps,

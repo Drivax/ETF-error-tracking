@@ -1,0 +1,57 @@
+{
+  "runs": [
+    {
+      "label": "1d_6mo",
+      "period": "6mo",
+      "interval": "1d",
+      "kpis": {
+        "ml_mae": 0.0010945838944274172,
+        "ml_rmse": 0.001767512793716334,
+        "trade_precision": 0.3935018050541516,
+        "hit_ratio_after_delay": 0.19494584837545126,
+        "realized_spread_capture": -3.691926438142636,
+        "max_drawdown": -233082.60791813,
+        "executed_trades": 277,
+        "total_realized_pnl": -146820.1899829738
+      },
+      "recalibration": {
+        "recommended_confidence_threshold": 0.7,
+        "recommended_min_expected_profit_bps": 30.0,
+        "objective_score": 0.25655,
+        "evaluated_trades": 229
+      },
+      "alert_count": 0,
+      "alert_rate": 0.0,
+      "assessment": "informative but poor realized trading quality"
+    },
+    {
+      "label": "5m_3d",
+      "period": "3d",
+      "interval": "5m",
+      "kpis": {
+        "ml_mae": 0.00012123852793471852,
+        "ml_rmse": 0.0003100897739064255,
+        "trade_precision": 0.0,
+        "hit_ratio_after_delay": 0.0,
+        "realized_spread_capture": 0.0,
+        "max_drawdown": 0.0,
+        "executed_trades": 0,
+        "total_realized_pnl": 0.0
+      },
+      "recalibration": {
+        "recommended_confidence_threshold": 0.7,
+        "recommended_min_expected_profit_bps": 0.0,
+        "objective_score": 0.0,
+        "evaluated_trades": 0
+      },
+      "alert_count": 0,
+      "alert_rate": 0.0,
+      "assessment": "conservative but not informative because no trades executed"
+    }
+  ],
+  "winner_for_live_defaults": {
+    "confidence_threshold": 0.7,
+    "min_expected_profit_bps": 30.0,
+    "reason": "Both intervals agree on a 0.70 confidence floor. Only the daily run produced enough executed trades to calibrate a profit gate, so 30 bps is the only evidence-backed live profit filter."
+  }
+}

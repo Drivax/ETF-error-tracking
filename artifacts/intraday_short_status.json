@@ -1,0 +1,26 @@
+{
+  "stage": "finished",
+  "summary": {
+    "label": "5m_3d",
+    "period": "3d",
+    "interval": "5m",
+    "kpis": {
+      "ml_mae": 0.00012123852793471852,
+      "ml_rmse": 0.0003100897739064255,
+      "trade_precision": 0.0,
+      "hit_ratio_after_delay": 0.0,
+      "realized_spread_capture": 0.0,
+      "max_drawdown": 0.0,
+      "executed_trades": 0,
+      "total_realized_pnl": 0.0
+    },
+    "recalibration": {
+      "recommended_confidence_threshold": 0.7,
+      "recommended_min_expected_profit_bps": 0.0,
+      "objective_score": 0.0,
+      "evaluated_trades": 0
+    },
+    "alert_count": 0,
+    "alert_rate": 0.0
+  }
+}
